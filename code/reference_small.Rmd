@@ -1,0 +1,137 @@
+---
+title: "Reference Analysis - Small Dataset"
+author: "Bohan Zhang"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(sechm)
+  library(edgeR)
+  library(dplyr)
+  library(stageR)
+  library(ggplot2)
+  library(patchwork)
+  library(cowplot)
+  library(ggrepel)
+})
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+```
+
+In this section, we apply the pipeline as in `reference_analysis.Rmd` on a small (reduced) dataset.
+
+# Load dataset
+
+```{r}
+se <- readRDS("./datasets/small_vHC.rds")
+dge <- DGEList(assay(se, "counts"))
+mm <- model.matrix(~ 0 + group, data=as.data.frame(colData(se)))
+dge <- calcNormFactors(dge)
+# Filter lowly expressed genes
+keep <- filterByExpr(dge, mm, min.count = 10)
+# Subset SE to only filtered genes
+se <- se[keep, ]
+
+set.seed(1)
+tmp <- SEtools::svacor(se, ~ 0 + group, numSVmethod = "be", method = "vst")
+tmp <- SEtools::svacor(se, ~ 0 + group, numSVmethod = "leek", method = "vst")
+# we use 2 SVs as "BE" suggested
+se <- SEtools::svacor(se, ~ 0 + group, n.sv = 2, method = "vst")
+se <- log2FC(se, "corrected", controls = grep("Ctrl", se$group), isLog = TRUE)
+```
+
+# Differential analysis (contrast-based approach)
+
+```{r}
+mm <- model.matrix(~ 0 + group, data=as.data.frame(colData(se)))
+dge <- calcNormFactors(DGEList(assay(se)))
+formula <- as.formula(paste(c("~ 0 + group", grep("^SV[0-9]+$",colnames(colData(se)),value=TRUE)), collapse="+"))
+mm <- model.matrix(formula , data = as.data.frame(colData(se))) 
+dge <- estimateDisp(dge, mm)
+fit <- glmQLFit(dge, mm, pseudocount = 0.5)
+
+#Define the constrasts to test for:
+contrast <- makeContrasts(
+  Stress_vs_CTRL = (groupFemale_Stress + groupMale_Stress) / 2 - (groupFemale_Ctrl + groupMale_Ctrl) / 2,  # Overall stress effect, averaged equally across both sexes
+  F_M_Stress = (groupFemale_Stress - groupFemale_Ctrl) - (groupMale_Stress - groupMale_Ctrl),  # Sex*Stress interaction: does the stress response differ between sexes?
+  F_vs_M_Ctrl = groupFemale_Ctrl - groupMale_Ctrl,  # Baseline sex difference (in Ctrls only) 
+  F_vs_M_Stress = groupFemale_Stress - groupMale_Stress,  # Sex difference in Stress group
+  F_Stress = groupFemale_Stress - groupFemale_Ctrl, # Stress response in females
+  M_Stress = groupMale_Stress - groupMale_Ctrl, # Stress response in males
+  levels = mm)
+
+Results_M <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "M_Stress"]),Inf))) 
+# Difference stress vs no stress in males
+
+Results_F <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "F_Stress"]),Inf))) 
+# Difference stress vs no stress in females
+
+Results_interaction <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[,"F_M_Stress"]),Inf)) 
+# Difference in response to stress between sexes
+
+# use stageR to boost power for the interaction
+Results2 <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, c("F_Stress", "M_Stress", "F_M_Stress", "Stress_vs_CTRL")]),Inf))
+pScreen2 <- Results2$PValue
+names(pScreen2) <- rownames(Results2)
+pConfirmation2 <- cbind(Interaction = Results_interaction[row.names(Results2),"PValue"])
+stageRObj2 <- stageR(pScreen = pScreen2, pConfirmation = pConfirmation2, pScreenAdjusted = FALSE)
+stageRObj2 <- stageWiseAdjustment(object = stageRObj2, method = "none", alpha = 0.05)
+adj_PVals2 <- getAdjustedPValues(stageRObj2, onlySignificantGenes = FALSE, order = FALSE) #returns NA for non-significant gene in pScreen
+adj_PVals2 <- as.data.frame(adj_PVals2)
+Results_interaction$staged.FDR <- adj_PVals2[rownames(Results_interaction),]$"Interaction"
+intDEGs <- rownames(na.omit(Results_interaction[Results_interaction$staged.FDR < 0.05, ]))
+intDEGs
+
+# save all the DEA results in SE object
+rowData(se)$DEA.Stress_vs_CTRL <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "Stress_vs_CTRL"]),Inf)) 
+rowData(se)$DEA.M_Stress <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "M_Stress"]),Inf))
+rowData(se)$DEA.F_Stress <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "F_Stress"]),Inf))
+rowData(se)$DEA.F_vs_M_Ctrl <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "F_vs_M_Ctrl"]),Inf)) 
+rowData(se)$DEA.F_vs_M_Stress <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, "F_vs_M_Stress"]),Inf)) 
+rowData(se)$DEA.interaction <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[,"F_M_Stress"]),Inf)) 
+rowData(se)$DEA.overall_result <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast),Inf)) 
+rowData(se)$DEA.subset_overall_result <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, c("F_Stress", "M_Stress", "F_M_Stress", "Stress_vs_CTRL")]),Inf))
+# save the staged.FDR for interaction for later use
+rowData(se)$Interaction_staged.FDR <- adj_PVals2[rownames(se),]$"Interaction"
+
+M_signif <- rownames(Results_M[Results_M$FDR < 0.05, ])
+F_signif <- rownames(Results_F[Results_F$FDR < 0.05, ])
+
+```
+
+# Save objects for later use
+
+```{r}
+# save this for later use
+stress_degs_MFunion <- union(M_signif, F_signif)
+stressed_animals <- se[,se$Condition == "Stress"]$SampleName
+mean_log2fc <- rowMeans(assay(se, "log2FC")[stress_degs_MFunion, stressed_animals])
+filtered_stress_degs_MFunion <- mean_log2fc[abs(mean_log2fc) > 0.1]
+
+DEGs <- list(
+  MF_union_stress_degs = stress_degs_MFunion,
+  MF_stress_degs_filtered = filtered_stress_degs_MFunion,
+  Interaction_degs_stageR_by_subsetResults = intDEGs)
+
+reference_small_obj = list(se = se, 
+                   DEGs = DEGs)
+saveRDS(reference_small_obj, "./objects/reference_analysis_small_obj.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

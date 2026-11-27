@@ -1,0 +1,146 @@
+---
+title: "Pitfall 4. Placing too much confidence in small datasets"
+author: "Bohan Zhang, Audran Feuvrier"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+```{css, echo = FALSE}
+p, dl, ol, ul, pre, img, table, h1, h2, h3, h4, h5, h6 {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  text-indent: 0 !important;
+}
+pre code { padding-left: 10px !important; }      /* keep a little space inside the grey box */
+pre.msg  { background-color: #ffffff; color: #cce0f3; } /* set up the color for message output */
+ol, ul { padding-left: 2em !important; }          /* keep bullets visible */
+.main-container { max-width: 1200px !important; } /* optional: use more page width */
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(sechm)
+  library(edgeR)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(stageR)
+  library(SummarizedExperiment)
+  library(ggplot2)
+  library(patchwork)
+  library(cowplot)
+  library(ggpubr)
+  library(ggbeeswarm)
+  library(ggrepel)
+})
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+set.seed(1234)
+```
+
+# Load data
+
+In this section, We revisit candidate genes identified from a small dataset DEA analysis. We compare their expression patterns across the original small dataset, the full dataset, and another independent small dataset
+
+```{r}
+small <- readRDS(file = "./objects/reference_analysis_small_obj.rds")
+se_small <- small$se
+df_small <- rowData(se_small)$DEA.interaction
+df_small$staged.FDR <- rowData(se_small)[rownames(df_small),]$Interaction_staged.FDR
+rownames(se_small) <- sub(".*\\.", "", rownames(se_small))
+
+# select the candidate genes from small dataset interaction analysis
+candidates <- rownames(se_small)[which(rowData(se_small)$Interaction_staged.FDR < 0.05 & rowData(se_small)$proteinCoding == TRUE)]
+candidates_order <- candidates[order(rowData(se_small[candidates,])$Interaction_staged.FDR)] # order them by staged.FDR for visualization 
+
+# load another small dataset
+# generated from 04_appendix_additional_small_dataset_analysis.Rmd
+small2 <- readRDS(file = "./objects/reference_analysis_small_obj_alternative.rds")
+se_small2 <- small2$se
+df_small2 <- rowData(se_small2)$DEA.interaction
+df_small2$staged.FDR <- rowData(se_small2)[rownames(df_small2),]$Interaction_staged.FDR
+rownames(se_small2) <- sub(".*\\.", "", rownames(se_small2))
+
+# load full dataset
+full <- readRDS(file = "./objects/reference_analysis_obj.rds")
+se_full <- full$se
+df_full <- rowData(se_full)$DEA.interaction
+df_full$staged.FDR <- rowData(se_full)[rownames(df_full),]$Interaction_staged.FDR
+rownames(se_full) = sub(".*\\.", "", rownames(se_full))
+```
+
+# Visualization
+
+```{r, warning = FALSE, message = FALSE, fig.width = 11, fig.height = 10, out.width = "100%"}
+df_small$staged.FDR <- ifelse(is.na(df_small$staged.FDR), 1, df_small$staged.FDR)
+show <- getrn(small$se, candidates)
+fig5a_left <- volcano(df_small, logFC = logFC, signif = staged.FDR, labels = show) +
+  labs(x = "Sex:Stress Interaction logFC", tag = "A") + 
+  coord_cartesian(xlim = c(-10, 10))
+
+fig5a_right <- genePlot(se_small, candidates, nrow = 1) + 
+  labs(title = "Small dataset (n=16)") + 
+  scale_color_manual(values = metadata(se_full)$anno_colors$Sex) + 
+  scale_y_continuous(limits = c(-1.1, 1.1)) + 
+  theme(axis.title = element_text(size = 10), axis.text = element_text(size = 8), plot.title = element_text(size = 14)) + 
+  facet_wrap(~factor(feature, levels = candidates_order), nrow = 1)  # order panels by staged.FDR
+
+df_small2$staged.FDR <- ifelse(is.na(df_small2$staged.FDR), 1, df_small2$staged.FDR)
+fig5b_left <- volcano(df_small2, logFC = logFC, signif = staged.FDR, labels = show) +
+  labs(x = "Sex:Stress Interaction logFC", tag = "B") + 
+  coord_cartesian(xlim = c(-10, 10))
+
+fig5b_right <- genePlot(se_small2, candidates, nrow = 1) + 
+  labs(title = "Small dataset 2 (n=16)") + 
+  scale_color_manual(values = metadata(se_full)$anno_colors$Sex) + 
+  theme(axis.title = element_text(size = 10), axis.text = element_text(size = 8), plot.title = element_text(size = 14)) + 
+  scale_y_continuous(limits = c(-1.1, 1.1)) + 
+  facet_wrap(~factor(feature, levels = candidates_order), nrow = 1)  # order panels by staged.FDR
+
+df_full$staged.FDR <- ifelse(is.na(df_full$staged.FDR), 1, df_full$staged.FDR)
+fig5c_left <- volcano(df_full, logFC = logFC, signif = staged.FDR, labels = show) +
+  labs(x = "Sex:Stress Interaction logFC", tag = "C")
+
+fig5c_right <- genePlot(se_full, candidates, nrow = 1) + 
+  labs(title = "Full dataset (n=122)") + 
+  scale_color_manual(values = metadata(se_full)$anno_colors$Sex) + 
+  theme(axis.title = element_text(size = 10), axis.text = element_text(size = 8), plot.title = element_text(size = 14)) + 
+  scale_y_continuous(limits = c(-1.1, 1.1)) + 
+  facet_wrap(~factor(feature, levels = candidates_order), nrow = 1)  # order panels by staged.FDR
+
+legend <- plot_grid(get_legend(fig5a_left + theme(legend.direction = "horizontal", legend.text = element_text(size = 10))), get_legend(fig5a_right + theme(legend.direction = "horizontal", legend.text = element_text(size = 10))), nrow = 1)
+
+fig5 <- plot_grid(
+          plot_grid(
+            plot_grid(fig5a_left + theme(legend.position = "none"), fig5a_right + theme(legend.position = "none"),
+                      nrow = 1, labels = NA, rel_widths = c(1, 2)),
+            plot_grid(fig5b_left + theme(legend.position = "none"), fig5b_right + theme(legend.position = "none"),
+                      nrow = 1, labels = NA, rel_widths = c(1, 2)),
+            plot_grid(fig5c_left + theme(legend.position = "none"), fig5c_right + theme(legend.position = "none"),
+                      nrow = 1, labels = NA, rel_widths = c(1, 2)),
+            nrow = 3), 
+            legend, 
+            ncol = 1, 
+          rel_heights = c(1, 0.05))
+fig5
+cairo_pdf("./figures/fig5_small_dataset_confidence.pdf", width = 11, height = 10)
+fig5
+dev.off()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

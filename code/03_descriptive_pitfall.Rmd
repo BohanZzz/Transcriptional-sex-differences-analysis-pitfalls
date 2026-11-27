@@ -1,0 +1,658 @@
+---
+title: "Pitfall 3. Taking descriptive discrepancies for significant group differences"
+author: "Bohan Zhang, Audran Feuvrier"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+```{css, echo = FALSE}
+p, dl, ol, ul, pre, img, table, h1, h2, h3, h4, h5, h6 {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  text-indent: 0 !important;
+}
+pre code { padding-left: 10px !important; }      /* keep a little space inside the grey box */
+pre.msg  { background-color: #ffffff; color: #cce0f3; } /* set up the color for message output */
+ol, ul { padding-left: 2em !important; }          /* keep bullets visible */
+.main-container { max-width: 1200px !important; } /* optional: use more page width */
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(sechm)
+  library(edgeR)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(stageR)
+  library(patchwork)
+  library(ggplot2)
+  library(ggpubr)
+  library(ggrepel)
+  library(rlang)
+  library(cowplot)
+  library(ggbeeswarm)
+  library(RRHO2)
+  library(magick)
+  library(ggplotify)
+})
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+```
+
+# Function preparation
+
+```{r}
+#' Do differential expression analysis to test stress effect on a subset
+#' @param se A SummarizedExperiment with a "counts" assay and colData column
+#'   `Condition`, and optionally `SV1..SVn`.
+#' @param effect What we are testing. (when doing stability test, choose "Condition"; when doing null comparison, choose "pseudoGroup" )
+#' @param n.sv The number of surrogate variables that we use for latent variation correction. set to 0 if not using SVA
+#' @return A data.frame from topTags() with every tested gene (logFC, logCPM,
+#'   F, PValue, FDR), sorted by p-value; rownames are gene IDs.
+stressDEA_for_subset <- function(se, effect, n.sv){
+  dge <- DGEList(assay(se, "counts"))
+  mm <- model.matrix(as.formula(paste("~ 0 + ", effect)), data=as.data.frame(colData(se)))
+  dge <- calcNormFactors(dge)
+  keep <- filterByExpr(dge, mm, min.count = 10)
+  se <- se[keep, ]
+  if(n.sv > 0){
+    set.seed(1)
+    suppressMessages(suppressWarnings(invisible(capture.output(
+      se <- SEtools::svacor(se, as.formula(paste("~ 0 + ", effect)), n.sv = n.sv, method = "vst")))))
+  }
+  formula <- as.formula(paste(c(paste0(" ~ ", effect), grep("^SV[0-9]+$",colnames(colData(se)),value=TRUE)), collapse="+")) 
+  mm <- model.matrix(formula, data = as.data.frame(colData(se)))
+  dge <- calcNormFactors(DGEList(assay(se)))
+  dge <- estimateDisp(dge, mm)
+  fit <- glmQLFit(dge, mm, pseudocount =0.5)
+  if(effect == "Condition") {Results <- as.data.frame(topTags(glmQLFTest(fit, "ConditionStress"), Inf))} else {Results <- as.data.frame(topTags(glmQLFTest(fit, "pseudoGroupstress"), Inf))}
+  return(Results)
+}
+
+#' Build a signed ranking metric from DE results (rank genes by sign(logFC) * -log10(p-value))
+#' @param df A DE results table (e.g. from stressDEA_for_subset) with columns
+#'   `logFC` and `PValue`; rownames are gene IDs.
+#' @return The same table plus columns `gene` and `rank_metric`
+rank_metrics <- function(df){
+  df$gene <- rownames(df)
+  df$rank_metric <- sign(df$logFC) * (-log10(df$PValue + 1e-300))
+  df <- df[!is.na(df$rank_metric), ]
+  df <- df[order(df$rank_metric, decreasing=TRUE), ]
+  return(df)
+}
+```
+
+# Load data
+
+We load the results generated in `02_baseline_bias.Rmd`. 
+
+```{r}
+baseline_bias_se_obj <- readRDS("./objects/baseline_bias_se_obj.rds")
+se_M <- baseline_bias_se_obj$male_baseline$SE
+se_F <- baseline_bias_se_obj$female_baseline$SE
+stress_degs_M <- baseline_bias_se_obj$male_baseline$DEGs$stress_DEGs  # stress DEGs from Male baseline analysis (Stress effect in Males)
+stress_degs_F <- baseline_bias_se_obj$female_baseline$DEGs$stress_DEGs # stress DEGs from Female baseline analysis (Stress effect in Females)
+df_M <- get_logFC_df(se_M, stress_degs_M, "Male baseline")
+df_F <- get_logFC_df(se_F, stress_degs_F, "Female baseline")
+
+# annotate the changing direction 
+d <- rbind(df_M, df_F)
+d$set <- apply(as.matrix(d[,1:2]), 1, \(x){
+  if(isNeg <- (sign(x)[which.max(abs(x))] < 0)) x <- -x
+  paste0(ifelse(isNeg, "down ", "up "), ifelse(x[1]>x[2], "stronger\nin males", "stronger\nin females"))  # add sex difference annotation based on observed logFC magnitudes
+  })
+```
+
+## Visualize in reduced dataset
+
+```{r}
+# filter low counts and SVA correction for small (reduced) dataset, to be used for visualization
+se <- readRDS("./datasets/small_vHC.rds")
+dge <- DGEList(assay(se, "counts"))
+mm <- model.matrix(~ 0 + group, data = as.data.frame(colData(se)))
+dge <- calcNormFactors(dge)
+# Filter lowly expressed genes
+keep <- filterByExpr(dge, mm, min.count = 10)
+# Subset SE to only filtered genes
+se <- se[keep, ]
+se <- SEtools::svacor(se, ~ 0 + group, n.sv = 2, method = "vst")
+se <- log2FC(se, "corrected", controls = grep("Ctrl", se$group))
+rownames(se) <- sub(".*\\.", "", rownames(se))
+```
+
+## Fig 4A
+
+Clusters are defined using observed logFC magnitudes. The conclusion of sex difference (i.e. stronger in one sex) emerged from descriptive summaries.
+
+```{r}
+fig4a <- sechm(
+  se, 
+  split(d$gene, d$set), 
+  gaps_at = "Condition", 
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE, 
+  anno_label_gp = list(size = 10, col = "white"),
+  column_title = NULL,
+  row_title_rot = 0, 
+  row_title_gp = gpar(fontsize = 10),
+  use_raster = "TRUE")
+fig4a
+```
+
+## Visualize in full dataset
+
+The conclusion of sex difference based on descriptive statistics resulting from small (reduced) dataset is no longer exhibited in full dataset. 
+
+```{r}
+full <- readRDS(file = "./objects/reference_analysis_obj.rds")
+res <- full$edgeR
+SE_full <- full$se
+rownames(SE_full) = sub(".*\\.", "", rownames(SE_full))
+SE_full$smallDataset <- colnames(SE_full) %in% colnames(se)
+SE_full <- SE_full[,order(SE_full$Condition, SE_full$Sex, SE_full$smallDataset)]
+
+res$gene <- sub(".*\\.", "", rownames(res))
+m <- merge(res, d, by="gene")  # merge the DEG results from full dataset with the direction annotation from d
+m$set2 <- paste0('"',gsub("\n", " ", gsub("up |down ", "", m$set)),'"')   # this is only for annotation. (removing "up"/"down", only keep "stronger in females/males")
+
+fig4b <- ggplot(m, aes(logFC.M_Stress, logFC.F_Stress)) + 
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "gray40") +
+  geom_hline(yintercept = 0, color = "gray40") +
+  geom_point() + 
+  geom_smooth(method = MASS::rlm, formula = y ~ 0 + x) + 
+  facet_wrap(~set2, scales = "free") +
+  xlab("log2FC (Males)") + ylab("log2FC (Females)") + 
+  theme_classic() + 
+  theme(strip.background = element_blank(), strip.text = element_text(size=11))
+fig4b
+```
+
+# Rank-Rank Hypergeometric Overlap (RRHO)
+
+RRHO is commonly used to compare genome-wide signatures. Ranking of genes based on DEA results is used to assess the similarity/difference of two subset in a descriptive manner [@plaisier_2010; @cahill_2018]. 
+
+## Ranking instability from small sample size
+
+When the method compares logFCs coming from small samples, a single sample in one comparison can skew the entire ranking, giving the false impression of a very different response. Or a wrongly similar one for that matter. 
+
+We sample 4 Stress vs. 4 Ctrl of males, and another 4 Stress vs. 4 Ctrl of males, to show the instability
+
+To demonstrate: The ranking of genes in response to stress is unstable — two draws from the same experiment give different, even opposite, stress signatures.
+
+(see Section \@ref(rrho-perm) for all permutations)
+
+### No SVA correction
+
+```{r, message = FALSE}
+# sampling 4 Stress vs 4 ctrl twice from male
+
+se <- readRDS("./datasets/whole_vHC_dataset.rds")
+rrho_rank_instability_noSVA <- list()
+for (seed in 111:120){
+  set.seed(seed)
+
+  eligible_exp <- unique(se$Experiment)
+  eligible_exp <- eligible_exp[eligible_exp != "vonZiegler.E3"]  # There are only 3 male stress sample in this experiment. So we exclude it
+  # Random sampling 1
+  # first pick up an Exp
+  exp1 <- sample(eligible_exp, 1)
+
+  # get available male samples from exp1
+  m_stress_exp1 <- colnames(se)[se$group == "Male_Stress" & se$Experiment == exp1]
+  m_ctrl_exp1 <- colnames(se)[se$group == "Male_Ctrl" & se$Experiment == exp1]
+
+  # Random sampling subset 1
+  s1 <- sample(m_stress_exp1, 4)
+  c1 <- sample(m_ctrl_exp1, 4)
+  used <- c(s1, c1) # record it to ensure that later the second subset don't overlap with the first one
+  
+  # pick experiment for subset 2 (can be same or different)
+  if(exp1 %in% c("vonZiegler.E2", "Floriou-servou.E2")){ # these two Exp don't have enough samples for two independent subsets. So if in sampling 1 we used them, we can't use them in sampling2
+    exp2 <- sample(setdiff(eligible_exp, c("vonZiegler.E2", "Floriou-servou.E2")), 1)
+  } else {
+    exp2 <- sample(eligible_exp, 1)  # otherwise we can sample from the same Exp
+  }
+
+  # get available male samples from exp2, excluding already used samples (make sure they don't overlap with the first sampling)
+  m_stress_exp2 <- setdiff(colnames(se)[se$group == "Male_Stress" & se$Experiment == exp2], used)
+  m_ctrl_exp2 <- setdiff(colnames(se)[se$group == "Male_Ctrl" & se$Experiment == exp2], used)
+
+  # Random sampling subset 2 
+  s2 <- sample(m_stress_exp2, 4)
+  c2 <- sample(m_ctrl_exp2, 4)
+
+  # Optional: report sampling details
+  # cat("  Subset 1 | Experiment:", exp1, "\n")
+  # cat("    Stress:", paste(s1, collapse=", "), "\n")
+  # cat("    Ctrl:  ", paste(c1, collapse=", "), "\n")
+  # cat("  Subset 2 | Experiment:", exp2, "\n")
+  # cat("    Stress:", paste(s2, collapse=", "), "\n")
+  # cat("    Ctrl:  ", paste(c2, collapse=", "), "\n")
+  # cat("  Overlap check:", length(intersect(c(s1,c1), c(s2,c2))), "shared samples (should be 0)\n\n")
+
+  se1 <- se[, c(s1, c1)]
+  se2 <- se[, c(s2, c2)]
+
+  # differential analysis
+  # first random sampling
+  Results_Condition_se1 <- stressDEA_for_subset(se1, effect = "Condition", n.sv = 0)
+
+  # differential analysis
+  # Second random sampling
+  Results_Condition_se2 <- stressDEA_for_subset(se2, effect = "Condition", n.sv = 0)
+
+  # ranking metrics
+  Results_Condition_se1 <- rank_metrics(Results_Condition_se1)
+  Results_Condition_se2 <- rank_metrics(Results_Condition_se2)
+
+  # ---- RRHO2 ----
+  list1 <- Results_Condition_se1[, c("gene", "rank_metric")]
+  list2 <- Results_Condition_se2[, c("gene", "rank_metric")]
+  
+  common_genes <- intersect(list1$gene, list2$gene)
+  list1 <- list1[list1$gene %in% common_genes,]
+  list2 <- list2[list2$gene %in% common_genes,]
+
+  rrho_out <- RRHO2_initialize(list1, list2,
+                                labels = c("subset 1 (4 Stress vs. 4 Ctrl)", "subset 2 (4 Stress vs. 4 Ctrl)"),
+                                log10.ind = TRUE)
+    rrho_out$sampleInfo <- list(
+    expA = exp1,
+    expB = exp1,
+    se1_ctrl   = s1,
+    se1_stress = c1,
+    se2_ctrl   = s2,
+    se2_stress = c2
+  )
+  rrho_rank_instability_noSVA[[paste0("seed_", seed)]] <- rrho_out  # save all the results
+}
+
+saveRDS(rrho_rank_instability_noSVA, "./supplements/RRHO_attempts/rrho_rank_instability_noSVA.rds", compress="xz")
+```
+
+### Using SVA correction
+
+Applying correction for latent variations [@leek_2007; @leek_2012] mitigated part of the sample variability, and in turn improved the stability of RRHO results
+
+```{r, message = FALSE}
+# sampling 4 Stress vs 4 ctrl twice from male
+
+se <- readRDS("./datasets/whole_vHC_dataset.rds")
+rrho_rank_instability_SVA <- list()
+for (seed in 111:120){
+  set.seed(seed)
+
+  eligible_exp <- unique(se$Experiment)
+  eligible_exp <- eligible_exp[eligible_exp != "vonZiegler.E3"]  # There are only 3 male stress sample in this experiment. So we exclude it
+  # Random sampling 1
+  # first pick up an Exp
+  exp1 <- sample(eligible_exp, 1)
+
+  # get available male samples from exp1
+  m_stress_exp1 <- colnames(se)[se$group == "Male_Stress" & se$Experiment == exp1]
+  m_ctrl_exp1 <- colnames(se)[se$group == "Male_Ctrl" & se$Experiment == exp1]
+
+  # Random sampling subset 1
+  s1 <- sample(m_stress_exp1, 4)
+  c1 <- sample(m_ctrl_exp1, 4)
+  used <- c(s1, c1) # record it to ensure that later the second subset don't overlap with the first one
+  
+  # pick experiment for subset 2 (can be same or different)
+  if(exp1 %in% c("vonZiegler.E2", "Floriou-servou.E2")){ # these two Exp don't have enough samples for two independent subsets. So if in sampling 1 we used them, we can't use them in sampling2
+    exp2 <- sample(setdiff(eligible_exp, c("vonZiegler.E2", "Floriou-servou.E2")), 1)
+  } else {
+    exp2 <- sample(eligible_exp, 1)  # otherwise we can sample from the same Exp
+  }
+
+  # get available male samples from exp2, excluding already used samples (make sure they don't overlap with the first sampling)
+  m_stress_exp2 <- setdiff(colnames(se)[se$group == "Male_Stress" & se$Experiment == exp2], used)
+  m_ctrl_exp2 <- setdiff(colnames(se)[se$group == "Male_Ctrl" & se$Experiment == exp2], used)
+
+  # Random sampling subset 2 
+  s2 <- sample(m_stress_exp2, 4)
+  c2 <- sample(m_ctrl_exp2, 4)
+
+  # Optional: report sampling details
+  # cat("  Subset 1 | Experiment:", exp1, "\n")
+  # cat("    Stress:", paste(s1, collapse=", "), "\n")
+  # cat("    Ctrl:  ", paste(c1, collapse=", "), "\n")
+  # cat("  Subset 2 | Experiment:", exp2, "\n")
+  # cat("    Stress:", paste(s2, collapse=", "), "\n")
+  # cat("    Ctrl:  ", paste(c2, collapse=", "), "\n")
+  # cat("  Overlap check:", length(intersect(c(s1,c1), c(s2,c2))), "shared samples (should be 0)\n\n")
+
+  se1 <- se[, c(s1, c1)]
+  se2 <- se[, c(s2, c2)]
+
+  # differential analysis
+  # first random sampling
+  Results_Condition_se1 <- stressDEA_for_subset(se1, effect = "Condition", n.sv = 1)    # we use 1 SVs for this analysis since the sample size is small
+  
+  # differential analysis
+  # Second random sampling
+  Results_Condition_se2 <- stressDEA_for_subset(se2, effect = "Condition", n.sv = 1)
+
+  # ranking metrics
+  Results_Condition_se1 <- rank_metrics(Results_Condition_se1)
+  Results_Condition_se2 <- rank_metrics(Results_Condition_se2)
+
+  # ---- RRHO2 ----
+  list1 <- Results_Condition_se1[, c("gene", "rank_metric")]
+  list2 <- Results_Condition_se2[, c("gene", "rank_metric")]
+  
+  common_genes <- intersect(list1$gene, list2$gene)
+  list1 <- list1[list1$gene %in% common_genes,]
+  list2 <- list2[list2$gene %in% common_genes,]
+
+  rrho_out <- RRHO2_initialize(list1, list2,
+                                labels = c("subset 1 (4 Stress vs. 4 Ctrl)", "subset 2 (4 Stress vs. 4 Ctrl)"),
+                                log10.ind = TRUE)
+  rrho_out$sampleInfo <- list(
+    expA = exp1,
+    expB = exp1,
+    se1_ctrl   = s1,
+    se1_stress = c1,
+    se2_ctrl   = s2,
+    se2_stress = c2
+  )
+  rrho_rank_instability_SVA[[paste0("seed_", seed)]] <- rrho_out  # save all the results
+}
+
+saveRDS(rrho_rank_instability_SVA, "./supplements/RRHO_attempts/rrho_rank_instability_SVA.rds", compress="xz")
+```
+
+## Null experiment (taking 4vs4 ctrl males randomly)
+
+We now generate a comparison with no genuine biological signal. We sample 6 samples only from male ctrl animals, and arbitrarily label them as "Ctrl" (n=4) or "Stress" (n=4). 
+
+To demonstrate: when used on (signed) p-values, other factors influencing the p-values (like mean expression level) create a misleading sense of similarity. 
+
+```{r, message = FALSE}
+se <- readRDS("./datasets/whole_vHC_dataset.rds")
+rrho_null_exp <- list()
+eligible_exp <- names(which(  # we choose the Exp that have enough samples
+  table(se$Experiment[se$group == "Male_Ctrl"]) >= 8
+))
+eligible_exp
+
+for (seed in 221:230){
+  set.seed(seed)
+
+  # pick 2 experiments
+  exp_pair <- sample(eligible_exp, 2, replace = FALSE)
+  expA <- exp_pair[1]
+  expB <- exp_pair[2]
+
+  # decide how many to take from each exp. Here we keep the number even, since we also want to balance the composition of our pseudo group later)
+  # n_A + n_B = 16 total (8 per subset x 2)
+  # Actually the only possible draw is 8 from ExpA and 8 from ExpB. Subset1 = 4A + 4B, Subset2 = 4A + 4B
+  pool_A <- colnames(se)[se$group == "Male_Ctrl" & se$Experiment == expA]
+  pool_B <- colnames(se)[se$group == "Male_Ctrl" & se$Experiment == expB]
+
+  # draw 8 from each exp, 4 for se1, 4 for se2
+  drawn_A <- sample(pool_A, 8, replace = FALSE)
+  drawn_B <- sample(pool_B, 8, replace = FALSE)
+
+  # se1: 4 from expA + 4 from expB, split 2+2 into pseudo_ctrl and pseudo_stress
+  se1_ctrl   <- c(drawn_A[1:2], drawn_B[1:2])
+  se1_stress <- c(drawn_A[3:4], drawn_B[3:4])
+
+  # se2: remaining 4 from expA + 4 from expB, same split
+  se2_ctrl   <- c(drawn_A[5:6], drawn_B[5:6])
+  se2_stress <- c(drawn_A[7:8], drawn_B[7:8])
+
+  # generate two subsets
+  se1 <- se[, c(se1_ctrl, se1_stress)]
+  se1$pseudoGroup <- factor(c(rep("ctrl", 4), rep("stress", 4)), levels = c("ctrl", "stress"))
+  
+  se2 <- se[, c(se2_ctrl, se2_stress)]
+  se2$pseudoGroup <- factor(c(rep("ctrl", 4), rep("stress", 4)), levels = c("ctrl", "stress"))
+  
+  # Optional: report sampling details
+  # cat("Permutation", seed, ":\n")
+  # cat("  Exp A:", expA, "| Exp B:", expB, "\n")
+  # cat("  se1 ctrl (n=4):  ", paste(se1_ctrl, collapse=", "), "\n")
+  # cat("  se1 stress (n=4):", paste(se1_stress, collapse=", "), "\n")
+  # cat("  se2 ctrl (n=4):  ", paste(se2_ctrl, collapse=", "), "\n")
+  # cat("  se2 stress (n=4):", paste(se2_stress, collapse=", "), "\n")
+  # cat("  Overlap se1/se2:", length(intersect(colnames(se1), colnames(se2))), "(should be 0)\n\n")
+
+  # differential analysis
+  # first random sampling
+  Results_Condition_se1 <- stressDEA_for_subset(se1, effect  = "pseudoGroup", n.sv = 1)
+
+  # Second random sampling
+  Results_Condition_se2 <- stressDEA_for_subset(se2, effect  = "pseudoGroup", n.sv = 1)
+
+  # ranking metrics
+  Results_Condition_se1 <- rank_metrics(Results_Condition_se1)
+  Results_Condition_se2 <- rank_metrics(Results_Condition_se2)
+
+  # ---- RRHO2 ----
+  list1 <- Results_Condition_se1[, c("gene", "rank_metric")]
+  list2 <- Results_Condition_se2[, c("gene", "rank_metric")]
+  
+  common_genes <- intersect(list1$gene, list2$gene)
+  list1 <- list1[list1$gene %in% common_genes,]
+  list2 <- list2[list2$gene %in% common_genes,]
+
+  rrho_out <- RRHO2_initialize(list1, list2,
+                                labels = c("subset 1 (n=8 from male Ctrl)", "subset 2 (n=8 from male Ctrl)"),
+                                log10.ind = TRUE)
+  rrho_out$sampleInfo <- list(
+    expA = expA,
+    expB = expB,
+    se1_ctrl   = se1_ctrl,
+    se1_stress = se1_stress,
+    se2_ctrl   = se2_ctrl,
+    se2_stress = se2_stress
+  )
+  rrho_null_exp[[paste0("seed_", seed)]] <- rrho_out  # save all the results
+}
+saveRDS(rrho_null_exp, "./supplements/RRHO_attempts/rrho_null_exp.rds", compress="xz")
+```
+
+In this case, we expect no signal (a completely blue map), since all the pvalue from this random dataset should be random. (see Section \@ref(rrho-perm) for all permutations)
+
+
+# Fig 4 summary
+
+```{r, warning = FALSE, fig.width = 10, fig.height = 8, out.width = "100%"}
+# first we plot the RRHO heatmap manually, to make it easier to adjust to the figure.
+# to simply check the plot, you can use the function RRHO2_heatmap() from the package
+# here we set the color gradients same as in the package
+jet.colors <- colorRampPalette(c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"))
+
+# set the range the same for the first two heatmaps
+colorGradient <- jet.colors(101)
+global_max1 <- 170
+col_fun_rank_instability <- circlize::colorRamp2(seq(0, global_max1, length.out = 101), colorGradient)
+# set another range for the third heatmap
+col_fun_null <- circlize::colorRamp2(seq(0, 60, length.out = 101), colorGradient)
+
+# three examples in Fig 4
+list4c1 <- rrho_rank_instability_noSVA[["seed_114"]]
+list4c2 <- rrho_rank_instability_noSVA[["seed_115"]]
+list4d <- rrho_null_exp[["seed_226"]]
+
+mat4c1 <- make_better_RRHO_matrix(list4c1$hypermat)
+fig4c1 <- RRHO_plot(mat4c1, colorFun = col_fun_rank_instability, col_title = "subset 1 (4 Stress vs. 4 Ctrl)", row_title = "subset 2 (4 Stress vs. 4 Ctrl)", show_legend = FALSE)
+
+mat4c2 <- make_better_RRHO_matrix(list4c2$hypermat)
+fig4c2 <- RRHO_plot(mat4c2, colorFun = col_fun_rank_instability, col_title = "subset 3 (4 Stress vs. 4 Ctrl)", row_title = "subset 4 (4 Stress vs. 4 Ctrl)", 
+            heatmap_legend_param = list(direction = "vertical", title_position = "leftcenter-rot",  # rotates title 90 degrees
+            legend_height = unit(6, "cm")))
+
+mat4d <- make_better_RRHO_matrix(list4d$hypermat)
+fig4d <- RRHO_plot(mat4d, colorFun = col_fun_null, col_title = "subset 1 (4 Ctrl vs. 4 Ctrl)", row_title = "subset 2 (4 Ctrl vs. 4 Ctrl)", 
+            heatmap_legend_param = list(direction = "vertical", title_position = "leftcenter-rot",  # rotates title 90 degrees
+            legend_height = unit(6, "cm")))
+
+title_rank_instability <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Independent Subsamples From The Same Comparison\nShow Inconsistent RRHO Patterns", fontface = "bold", size = 4) + theme_void()
+title_null_exp <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Null Comparison Shows\nStructured RRHO Pattern", fontface = "bold", size = 4) + theme_void()
+
+fig4 <- plot_grid(
+          plot_grid(
+            as.ggplot(function() draw(fig4a, merge_legends = TRUE)),
+            fig4b,
+            nrow = 1, labels = c("A", "B"), scale = c(0.9, 0.95)),
+          plot_grid(title_rank_instability, title_null_exp, nrow = 1, rel_widths = c(1.8, 1), labels = c("C", "D")),
+          plot_grid(
+            plotlist = lapply(list(fig4c1, fig4c2, fig4d), \(x) grid.grabExpr(draw(x), wrap = TRUE, wrap.grobs = TRUE)),
+            nrow = 1, rel_widths = c(0.85, 1, 1)),
+          nrow = 3, rel_heights = c(1, 0.15, 1))
+fig4
+pdf("./figures/fig4_descriptive_pitfall.pdf", width = 10, height = 8)
+fig4
+dev.off()
+```
+
+# Supplement - RRHO permutations summary {#rrho-perm}
+
+```{r, fig.width = 10, fig.height = 11, out.width = "100%"}
+jet.colors <- colorRampPalette(c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"))
+
+# set the range 
+colorGradient <- jet.colors(101) 
+global_max1 <- 170   # for instability panels
+col_fun_rank_instability <- circlize::colorRamp2(seq(0, global_max1, length.out = 101), colorGradient)
+global_max2 <- 30  # for null comparison panels
+col_fun_null <- circlize::colorRamp2(seq(0, global_max2, length.out = 101), colorGradient)
+
+rrho_rank_instability_noSVA <- readRDS("./supplements/RRHO_attempts/rrho_rank_instability_noSVA.rds")
+rrho_rank_instability_SVA <- readRDS("./supplements/RRHO_attempts/rrho_rank_instability_SVA.rds")
+rrho_null_exp <- readRDS("./supplements/RRHO_attempts/rrho_null_exp.rds")
+
+
+ht_list_rank_instability_noSVA <- lapply(names(rrho_rank_instability_noSVA), function(seed_name) {
+  mat <- make_better_RRHO_matrix(rrho_rank_instability_noSVA[[seed_name]]$hypermat)
+  ht  <- RRHO_plot(mat, colorFun = col_fun_rank_instability,
+                   col_title = "subset 1 (4 Stress vs. 4 Ctrl)",
+                   row_title = "subset 2 (4 Stress vs. 4 Ctrl)",
+                   fontsize = 8, show_legend = FALSE)
+  grid.grabExpr(draw(ht, column_title = seed_name, column_title_gp = gpar(fontsize = 10)),
+                wrap = TRUE, wrap.grobs = TRUE)
+})
+
+title_rank_stability_noSVA <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "RRHO Ranking Stability (No Correction For Latent Variation)", fontface = "bold", size = 4) + theme_void()
+
+ht_list_rank_instability_SVA <- lapply(names(rrho_rank_instability_SVA), function(seed_name) {
+  mat <- make_better_RRHO_matrix(rrho_rank_instability_SVA[[seed_name]]$hypermat)
+  ht  <- RRHO_plot(mat, colorFun = col_fun_rank_instability,
+                   col_title = "subset 1 (4 Stress vs. 4 Ctrl)", row_title = "subset 2 (4 Stress vs. 4 Ctrl)",
+                   fontsize = 8, show_legend = FALSE)
+  grid.grabExpr(draw(ht, column_title = seed_name, column_title_gp = gpar(fontsize = 10)),
+                wrap = TRUE, wrap.grobs = TRUE)
+})
+
+title_rank_stability_SVA <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "RRHO Ranking Stability (Latent Variation Corrected Using SVA)", fontface = "bold", size = 4) + theme_void()
+
+
+ht_list_null_exp <- lapply(names(rrho_null_exp), function(seed_name) {
+  mat <- make_better_RRHO_matrix(rrho_null_exp[[seed_name]]$hypermat)
+  ht  <- RRHO_plot(mat, colorFun = col_fun_null,
+                   col_title = "subset 1 (Male Ctrl n=8)", row_title = "subset 2 (Male Ctrl n=8)",
+                   fontsize = 8, show_legend = FALSE)
+  grid.grabExpr(draw(ht, column_title = seed_name, column_title_gp = gpar(fontsize = 10)),
+                wrap = TRUE, wrap.grobs = TRUE)
+})
+
+title_null_exp <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "RRHO Null Comparison Experiment", fontface = "bold", size = 4) + theme_void()
+
+legend_rank_instabitliy <- grid.grabExpr(
+  draw(
+    Heatmap(matrix(seq(0, global_max1, length.out = 10)),
+            col = col_fun_rank_instability,
+            name = "-log10(P-value)",
+            heatmap_legend_param = list(
+              direction = "vertical",
+              title_position = "leftcenter-rot",
+              legend_height = unit(6, "cm"),
+              at = c(0, 35, 70, 105, 140, 170),
+              labels = c("0", "35", "70", "105", "140", "170")),
+            show_heatmap_legend = TRUE,
+            show_row_dend = FALSE,
+            show_column_dend = FALSE,
+            show_row_names = FALSE,
+            show_column_names = FALSE,
+            width = unit(0, "cm"),
+            height = unit(0, "cm")),
+    heatmap_legend_side = "right"
+  ), wrap = TRUE, wrap.grobs = TRUE)
+
+legend_null <- grid.grabExpr(
+  draw(
+    Heatmap(matrix(seq(0, global_max2, length.out = 10)),
+            col = col_fun_null,
+            name = "-log10(P-value)",
+            heatmap_legend_param = list(
+              direction = "vertical",
+              title_position = "leftcenter-rot",
+              legend_height = unit(6, "cm")),
+            show_heatmap_legend = TRUE,
+            show_row_dend = FALSE,
+            show_column_dend = FALSE,
+            show_row_names = FALSE,
+            show_column_names = FALSE,
+            width = unit(0, "cm"),
+            height = unit(0, "cm")),
+    heatmap_legend_side = "right"
+  ), wrap = TRUE, wrap.grobs = TRUE)
+  
+spacer <- ggplot() + theme_void()
+
+supp_fig1_RRHO <- plot_grid( 
+      plot_grid(
+        plot_grid(
+          title_rank_stability_noSVA, 
+          plot_grid(plotlist = ht_list_rank_instability_noSVA[1:5], nrow = 1),
+          plot_grid(plotlist = ht_list_rank_instability_noSVA[6:10], nrow = 1),
+          spacer, 
+          nrow = 4, rel_heights = c(0.2, 1, 1, 0.15)),
+        plot_grid(
+          title_rank_stability_SVA, 
+          plot_grid(plotlist = ht_list_rank_instability_SVA[1:5], nrow = 1),
+          plot_grid(plotlist = ht_list_rank_instability_SVA[6:10], nrow = 1),
+          spacer, 
+          nrow = 4, rel_heights = c(0.2, 1, 1, 0.15)),
+        plot_grid(
+          title_null_exp,
+          plot_grid(plotlist = ht_list_null_exp[1:5], nrow = 1),
+          plot_grid(plotlist = ht_list_null_exp[6:10], nrow = 1), 
+          spacer, 
+          nrow = 4, rel_heights = c(0.2, 1, 1, 0.15)),
+        nrow = 3, 
+        ncol = 1,
+        labels = c("A", "B", "C")
+      ),
+      plot_grid(legend_rank_instabitliy, legend_rank_instabitliy, legend_null, ncol = 1),
+      nrow = 1,
+      rel_widths = c(1, 0.1)
+    )
+supp_fig1_RRHO
+
+pdf("./supplements/supp_fig1_RRHO.pdf", width = 10, height = 11)
+supp_fig1_RRHO
+dev.off()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+# Reference

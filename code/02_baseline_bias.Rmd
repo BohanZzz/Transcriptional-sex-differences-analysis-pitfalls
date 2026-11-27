@@ -1,0 +1,515 @@
+---
+title: "Pitfall 2. Reference bias, and the misinterpretation of model coefficients"
+author: "Bohan Zhang, Audran Feuvrier"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+```{css, echo = FALSE}
+p, dl, ol, ul, pre, img, table, h1, h2, h3, h4, h5, h6 {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  text-indent: 0 !important;
+}
+pre code { padding-left: 10px !important; }      /* keep a little space inside the grey box */
+pre.msg  { background-color: #ffffff; color: #cce0f3; } /* set up the color for message output */
+ol, ul { padding-left: 2em !important; }          /* keep bullets visible */
+.main-container { max-width: 1200px !important; } /* optional: use more page width */
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(sechm)
+  library(edgeR)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(stageR)
+  library(patchwork)
+  library(ggplot2)
+  library(ggpubr)
+  library(ggrepel)
+  library(ggplotify)
+  library(rlang)
+  library(cowplot)
+  library(magick)
+})
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+```
+
+# Different model formulation
+
+## Load data
+
+we use the reduced dataset for this section
+
+Quick reminder: this dataset contrains 16 samples with balanced number of female and males. Only one experiment is included.
+
+```{r}
+se <- readRDS("./datasets/small_vHC.rds")
+```
+
+## Female as baseline 
+
+Firstly, we set Female as reference level of the Sex.
+
+```{r}
+se_F <- se
+colData(se_F)$Sex <- factor(colData(se_F)$Sex, levels = c("Female", "Male")) # set Female as the reference level
+se_F <- se_F[, order(colData(se_F)$Sex)]
+
+table(se_F$group)
+
+dge <- DGEList(assay(se_F, "counts"))
+mm <- model.matrix(~ Sex * Condition, data=as.data.frame(colData(se_F)))
+dge <- calcNormFactors(dge)
+keep <- filterByExpr(dge, mm, min.count = 10)# Filter out lowly expressed genes (less than 10 reads)
+dge <- dge[keep, ]
+se_F <- se_F[rownames(dge), ]# Subset SE to only filtered genes
+```
+
+```{r}
+set.seed(16)
+tmp <- SEtools::svacor(se_F, ~  Sex * Condition, numSVmethod = "be", method = "vst") # suggested 2 SVs
+tmp <- SEtools::svacor(se_F, ~  Sex * Condition, numSVmethod = "leek", method = "vst")
+
+se_F <- SEtools::svacor(se_F, ~ Sex * Condition, n.s = 2)
+# pp <- plotMDS(assay(se_F,"corrected"), plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_F)), x=pp$x, y=pp$y)
+# ggplot(mds, aes(x,y,shape=Sex,colour=Condition)) + 
+#   geom_point() +
+#   labs(title = "MDS: 2 Surrogate variables")
+```
+
+```{r}
+# Compute log2FC changes relative to Ctrls. This assay will later be used for visualization
+se_F <- log2FC(se_F, "corrected", controls = grep("Ctrl", se_F$group), isLog = TRUE)
+
+# create an edgeR object, storing count data and associated sample information
+dge <- DGEList(assay(se_F))
+# The model contains Sex and Condition, and their interaction, and the surrogate variables (SVs)
+formula <- as.formula(paste(c("~ Sex * Condition", grep("^SV[0-9]+$",colnames(colData(se_F)),value=TRUE)), collapse="+"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_F)))
+dge <- calcNormFactors(dge)  # calculate TMM normalization factors to correct for differences in library composition between samples
+dge <- estimateDisp(dge, mm) # estimate dispersion
+
+# Fit quasi-likelihood negative-binomial models
+fit <- glmQLFit(dge, mm, prior.count = 0.5)
+assay(se_F, "logcpm") <- log1p(cpm(dge)) # calculate logcpm for later visualization
+
+Results_stress_F <- as.data.frame(topTags(glmQLFTest(fit,coef = "ConditionStress"),Inf))
+# Results_stress_F selects "ConditionStress"
+# Answering the question: is there any Stress effect in Females (becase Female is the reference sex) 
+# This is often misinterpreted as general stress effect across sexes.
+
+Results_interaction_F <- as.data.frame(topTags(glmQLFTest(fit, coef = "SexMale:ConditionStress"),Inf))
+# Results_interaction_F only tests the interaction of Sex and Condition
+# Answering the question: does the Stress effect differs between sexes
+
+Results_both_F <- as.data.frame(topTags(glmQLFTest(fit,coef = c("ConditionStress", "SexMale:ConditionStress")),Inf))
+# Results_both_F selects both ConditionStress and SexMale:ConditionStress
+# Answering the question: does Stress matter at all, either as a "main" effect or through its interaction with Sex
+```
+
+```{r}
+stress_degs_F <- rownames(Results_stress_F[Results_stress_F$FDR < 0.05,])
+interaction_degs_F <- rownames(Results_interaction_F[Results_interaction_F$FDR < 0.05,])
+stress_interaction_degs_F <- rownames(Results_both_F[Results_both_F$FDR < 0.05,])
+
+# Renaming for visualization
+se_renamed_F <- se_F
+rownames(se_renamed_F) <- sub(".*\\.", "", rownames(se_renamed_F))
+stress_degs_renamed_F <- sub(".*\\.", "", stress_degs_F)
+```
+
+### Fig 3A
+
+```{r}
+fig3a <- sechm(
+  se = se_renamed_F, 
+  feature = stress_degs_renamed_F, 
+  gaps_at = c("Condition"), 
+  assayName = "scaledLFC", 
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE, 
+  anno_label_gp = list(size = 10, col = "white"),
+  column_title = NULL,  
+  use_raster = TRUE,
+  show_heatmap_legend = FALSE,
+  show_annotation_legend = FALSE
+)
+fig3a
+```
+
+```{r}
+# Optional: check stress DEGs signature in boxplot
+sexLogFC_stressSignature_plts(se_F, stress_degs_F, "Stress", "Stress")
+```
+
+## Male as baseline 
+
+In this section, we reset Male as reference level of Sex, and apply the same DEA as above.
+
+```{r}
+se_M <- se
+colData(se_M)$Sex <- factor(colData(se_M)$Sex, levels = c("Male", "Female"))  # here we set Male as the reference level
+
+dge <- DGEList(assay(se_M, "counts"))
+mm <- model.matrix(~ Sex * Condition, data=as.data.frame(colData(se_M)))
+dge <- calcNormFactors(dge)
+keep <- filterByExpr(dge, mm, min.count = 10)# Filter out lowly expressed genes (less than 10 reads)
+dge <- dge[keep, ]
+se_M <- se_M[rownames(dge), ] # Subset SE to only filtered genes
+dge <- estimateDisp(dge, mm) # estimate dispersion
+```
+
+```{r}
+set.seed(1)
+tmp <- SEtools::svacor(se_M, ~  Sex * Condition, numSVmethod = "be", method = "vst")  # suggested 2 SVs
+tmp <- SEtools::svacor(se_M, ~  Sex * Condition, numSVmethod = "leek", method = "vst")
+
+se_M <- SEtools::svacor(se_M, ~ Sex * Condition, n.sv = 2, method = "vst")
+# pp <- plotMDS(assay(se_M,"corrected"), plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_M)), x=pp$x, y=pp$y)
+# ggplot(mds, aes(x, y, shape = Sex, colour = Condition)) + 
+#   geom_point() +
+#   labs(title = "MDS: 2 Surrogate variables")
+```
+
+```{r}
+se_M <- log2FC(se_M, "corrected", controls = grep("Ctrl", se_M$group), isLog = TRUE)  # calculate the logFC (Stress vs. control)
+dge <- DGEList(assay(se_M))
+formula <- as.formula(paste(c("~ Sex * Condition", grep("^SV[0-9]+$",colnames(colData(se_M)),value=TRUE)), collapse="+"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_M)))
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge, mm)
+assay(se_M, "logcpm") <- log1p(cpm(dge))
+fit <- glmQLFit(dge, mm)
+
+Results_stress_M <- as.data.frame(topTags(glmQLFTest(fit, coef = "ConditionStress"),Inf))
+# Now Results_stress_M answers the question: is there any Stress effect in Males (becase Male is the reference sex) 
+
+Results_interaction_M <- as.data.frame(topTags(glmQLFTest(fit, coef = "SexFemale:ConditionStress"),Inf))
+Results_both_M <- as.data.frame(topTags(glmQLFTest(fit, coef = c("ConditionStress", "SexFemale:ConditionStress")),Inf))
+```
+
+```{r}
+stress_degs_M <- rownames(Results_stress_M[Results_stress_M$FDR < 0.05,])
+interaction_degs_M <- rownames(Results_interaction_M[Results_interaction_M$FDR < 0.05,])
+stress_interaction_degs_M <- rownames(Results_both_M[Results_both_M$FDR < 0.05,])
+
+# Rename for visualization
+se_renamed_M <- se_M
+rownames(se_renamed_M) <- sub(".*\\.", "", rownames(se_renamed_M))
+stress_degs_renamed_M <- sub(".*\\.", "", stress_degs_M)
+se_renamed_M$Sex <- factor(se_renamed_M$Sex, levels = c("Female", "Male"))
+se_renamed_M <- se_renamed_M[, order(se_renamed_M$Condition, se_renamed_M$Sex)]
+```
+
+### Fig 3B
+
+```{r}
+fig3b <-  sechm(
+  se = se_renamed_M, 
+  feature = stress_degs_renamed_M, 
+  gaps_at = c("Condition"), 
+  assayName = "scaledLFC", 
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE, 
+  anno_label_gp = list(size = 10, col = "white"),
+  column_title = NULL, 
+  use_raster=TRUE
+)
+fig3b
+```
+
+```{r}
+# Optional: check stress DEGs signature in boxplot
+sexLogFC_stressSignature_plts(se_M, stress_degs_M, "Stress", "Stress")
+```
+
+# Different model formulation slop plot (fig 3C)
+
+This plot compare the three approaches: Female-baseline model, Male-baseline model, Reference analysis. 
+
+```{r}
+ref <- readRDS("./objects/reference_analysis_obj.rds")  # results from reference analysis. See reference_analysis.Rmd and section 2.6
+SE_ref <- ref$se
+DEGs_ref <- names(ref$DEGs$MF_stress_degs_filtered)
+
+df_ref <- get_logFC_df(SE_ref, DEGs_ref, "Reference")
+df_M <- get_logFC_df(se_M, stress_degs_M, "Male baseline")
+df_F <- get_logFC_df(se_F, stress_degs_F, "Female baseline")
+
+combined_df <- rbind(df_ref, df_M, df_F)
+
+common_genes <- intersect(stress_degs_M, stress_degs_F)
+common_genes <- sub(".*\\.", "", common_genes)
+combined_df$color_group <- ifelse(combined_df$gene %in% common_genes, 
+                                 "Male \u2229 Female", 
+                                  as.character(combined_df$dataset))
+
+fig3c <- ggplot(combined_df, aes(x = males, y = females)) +
+  geom_point(data = subset(combined_df, dataset != "Reference"), 
+             aes(color = color_group), size = 0.7, alpha = 1) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "gray40") +
+  geom_hline(yintercept = 0, color = "gray40") +
+  xlab("log2FC (Males)") +
+  ylab("log2FC (Females)") +
+  ggtitle("Stress DEGs of Different Model Formulations") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(),
+    legend.title = element_blank()
+  ) +
+  geom_smooth(method = MASS::rlm, 
+              method.args = list(formula = y ~ 0 + x),
+              aes(group = dataset, color = dataset), se = F, fullrange = TRUE) + 
+  scale_color_manual(values = c("Reference" = "#DC3220", 
+                                "Male baseline" = "#E1BE6A", 
+                                "Female baseline" = "#40B0A6",
+                                "Male \u2229 Female" = "gray30"))
+
+fig3c
+```
+
+# Permutation (fig 3D)
+
+We repeatedly subsample the original data to evaluate whether the baseline-dependent bias observed above is stable. For each permutation, we randomly subsample, then fit a female-baseline model and a male-baseline model, respectively, then compare the resulting genes as above.
+
+```{r}
+se <- readRDS("./datasets/whole_vHC_dataset.rds")
+table(se[,se$Experiment %in% c("Privitera.E2", "vonZiegler.E3")]$group)
+```
+
+```{r}
+set.seed(1234)
+
+exp_configs <- list("Privitera.E2" = 13, "vonZiegler.E3" = 2)
+n_samples_per_group <- 3
+
+# Reading analyzed dataset
+ref <- readRDS("./objects/reference_analysis_obj.rds")
+SE_ref <- ref$se
+DEGs_ref <- names(ref$DEGs$MF_stress_degs_filtered)
+
+rownames(SE_ref) <- clean_name(rownames(SE_ref))
+DEGs_ref <- clean_name(DEGs_ref)
+
+# Calculate Reference Stress Coef
+df_ref <- calculate_stress_coef(SE_ref, DEGs_ref, "Reference\n")
+
+# Initialize a list to store results of each permutations
+permutations <- list()
+
+# --- 2. PROCESSING ---
+for (exp_id in names(exp_configs)) {
+  
+  se_exp <- se[, se$Experiment == exp_id]
+  n_perms <- exp_configs[[exp_id]]
+  idx_list <- split(seq_len(ncol(se_exp)), se_exp$group)
+  
+  # Optional: report the process
+  # message(sprintf("\n--- Processing Experiment: %s (%d permutations) ---", exp_id, n_perms))
+
+  for (i in 1:n_perms) {
+    # Optional: report the progress
+    # message(sprintf("Running Permutation %d/%d...", i, n_perms))
+    
+    # Subsampling
+    selected_idx <- unlist(lapply(idx_list, function(x) sample(x, n_samples_per_group)))
+    se_perm <- se_exp[, selected_idx]
+    
+    # Batch Correction
+    suppressMessages(suppressWarnings(invisible(capture.output(
+      se_perm <- SEtools::svacor(se_perm, ~ Sex * Condition, n.sv = 1, method = "vst")
+    ))))
+
+    # Calculate log2FC on corrected counts
+    se_perm <- log2FC(se_perm, "corrected", controls = se_perm$Condition == "Ctrl")
+    
+    # edgeR
+    dge <- DGEList(assay(se_perm, "counts"))
+    dge <- calcNormFactors(dge)
+    coldata_perm <- as.data.frame(colData(se_perm))
+    
+    # --- Male Baseline Model ---
+    mm_m <- model.matrix(~ Sex * Condition + SV1, data = coldata_perm)
+    dge <- estimateDisp(dge, mm_m)
+    fit_m <- glmFit(dge, mm_m)
+    res_m <- as.data.frame(topTags(glmLRT(fit_m, coef = "ConditionStress"), Inf))
+    m_degs <- rownames(res_m[res_m$FDR < 0.05, ])
+    # print(length(m_degs))  # optional: report DEG number
+    
+    # --- Female Baseline Model ---
+    coldata_f <- coldata_perm
+    coldata_f$Sex <- factor(coldata_f$Sex, levels = c("Female", "Male"))
+    mm_f <- model.matrix(~ Sex * Condition + SV1, data = coldata_f)
+    # We reuse the dispersions from dge and re-fit the releveled model
+    fit_f <- glmFit(dge, mm_f)
+    res_f <- as.data.frame(topTags(glmLRT(fit_f, coef = "ConditionStress"), Inf))
+    f_degs <- rownames(res_f[res_f$FDR < 0.05, ])
+    # print(length(f_degs))  # optional: report DEG number
+
+    rownames(se_perm) <- clean_name(rownames(se_perm))
+    
+    # --- Coefficient calculation ---
+    df_male <- calculate_stress_coef(se_perm, clean_name(m_degs), "Male\nBaseline") 
+    df_female <- calculate_stress_coef(se_perm, clean_name(f_degs), "Female\nBaseline")
+    
+# Add metadata to identify the source of these rows
+    df_male$Permutation <- i
+    df_male$Experiment <- exp_id
+    df_female$Permutation <- i
+    df_female$Experiment <- exp_id
+    
+    # Append to the list
+    permutations[[length(permutations) + 1]] <- df_male
+    permutations[[length(permutations) + 1]] <- df_female
+  }
+}
+
+# Combine all permutation results into one data frame
+df_all_perms <- do.call(rbind, permutations)
+
+# Ensure the Reference data frame has the same columns for binding
+df_ref$Permutation <- 0
+df_ref$Experiment <- "Reference"
+
+# Stack Reference at the top followed by all permutations
+final_df <- rbind(df_ref, df_all_perms)
+
+# Optional: View the structure
+print(head(final_df))    
+
+```
+
+## Fig 3D
+
+```{r}
+# 1. Define global limits
+# Calculate the min and max across the entire dataset so both plots share the exact same scale
+global_limits <- range(final_df$coefficient, na.rm = TRUE)
+label_height = 1.5
+
+# 2. Set shared theme
+common_theme <- list(
+  geom_boxplot(position = position_dodge(0.8), width = 0.7, outlier.shape = NA, alpha = 0.4),
+  geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8), 
+             size = 1.5, shape = 21, color = "black", stroke = 0.5),
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", alpha = 0.6),
+  stat_compare_means(aes(group = Sex), method = "t.test", label = "p.signif", label.y = label_height),
+  scale_fill_manual(values = c("Male" = "#E1BE6A", "Female" = "#40B0A6")),
+  theme_bw(),
+  theme(panel.grid = element_blank())
+)
+
+# 3. Plot Reference analysis (Individual Sample Coefs)
+p_ref <- subset(final_df, dataset == "Reference\n") %>% 
+  ggplot(aes(x = Condition, y = coefficient, fill = Sex)) +
+  facet_wrap(~ dataset) + 
+  common_theme +
+  # Force the Y-axis to the global range
+  coord_cartesian(ylim = global_limits) + 
+  labs(
+    y = "Stress LogFC Curve Slope (Per Sample)", 
+    x = NULL
+  )
+
+# 4. Plot Permutation results (Means)
+p_perm <- subset(final_df, dataset != "Reference\n") %>% 
+  ggplot(aes(x = Condition, y = coefficient, fill = Sex)) +
+  facet_wrap(~ dataset) +
+  common_theme +
+  # Force the Y-axis to the same global range
+  coord_cartesian(ylim = global_limits) + 
+  labs(
+    y = "Group Average Stress LogFC Curve Slope\n(Per Permutation)", 
+    x = NULL
+  ) +
+  theme(
+    axis.title.y = element_text(margin = margin(l = 10)), # Add space for the label
+     axis.text.y = element_blank(), axis.ticks.y = element_blank()
+  )
+
+fig3d <- p_ref + p_perm + 
+  plot_layout(guides = "collect", widths = c(1, 2)) + 
+  plot_annotation(
+    title = "Stability of the Baseline Bias across 15 Sample Permutations",
+    subtitle = "Stress LogFC Curve Slope of the Reference versus Baseline Models"
+  )
+
+fig3d
+```
+
+# Fig 3 Summary
+
+Final assembly of the plot.
+
+```{r, warning=FALSE, fig.width = 11, fig.height = 12.5, out.width = "100%"}
+# add illustration: regression to the mean
+fig3e <- ggdraw() + draw_image(
+  image_trim(image_read_svg("./figures/regression_to_the_mean.svg"))
+)
+fig3 <- plot_grid(
+  plot_grid(
+  as.ggplot(function() draw(fig3a, merge_legends = TRUE)) + ggtitle("Female Baseline Stress DEGs") + theme(plot.title = element_text(hjust = 0.35, face = "bold")),
+  as.ggplot(function() draw(fig3b, merge_legends = TRUE)) + ggtitle("Male Baseline Stress DEGs") + theme(plot.title = element_text(hjust = 0.35, face = "bold")), 
+  fig3c + theme(legend.position="bottom"), 
+  fig3d, 
+  ncol = 2, labels = "AUTO", rel_widths = c(1,1), rel_heights = c(3.5,2), scale = 0.95),
+  fig3e,
+  nrow = 2, labels = c("", "E"), rel_heights = c(3.5,1)
+)
+
+fig3
+
+# save fig3 pdf
+cairo_pdf("./figures/fig3_baseline.pdf", width = 11, height = 12.5) #cairo_pdf to render the Intersect unicode symbol from logFC plot
+fig3
+dev.off()
+```
+
+# Save some objects for later use
+
+```{r}
+baseline_bias_results <- list(
+  male_baseline = list(
+    SE = se_M,
+    DEGs = list(
+      stress_DEGs = stress_degs_M,
+      interaction_DEGs = interaction_degs_M,
+      stress_interaction_DEGs = stress_interaction_degs_M
+    )
+  ),
+  female_baseline = list(
+    SE = se_F,
+    DEGs = list(
+      stress_DEGs = stress_degs_F,
+      interaction_DEGs = interaction_degs_F,
+      stress_interaction_DEGs = stress_interaction_degs_F
+    )
+  )
+)
+saveRDS(baseline_bias_results, "./objects/baseline_bias_se_obj.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

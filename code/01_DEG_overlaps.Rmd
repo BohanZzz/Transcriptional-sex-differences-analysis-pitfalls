@@ -1,0 +1,465 @@
+---
+title: "Pitfall 1. Over-interpretation of the overlap of differentially-expressed genes"
+author: "Bohan Zhang, Audran Feuvrier"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+```{css, echo = FALSE}
+p, dl, ol, ul, pre, img, table, h1, h2, h3, h4, h5, h6 {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  text-indent: 0 !important;
+}
+pre code { padding-left: 10px !important; }      /* keep a little space inside the grey box */
+pre.msg  { background-color: #ffffff; color: #cce0f3; } /* set up the color for message output */
+ol, ul { padding-left: 2em !important; }          /* keep bullets visible */
+.main-container { max-width: 1200px !important; } /* optional: use more page width */
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(sechm)          # heatmap visualization
+  library(edgeR)          # differential expression analysis
+  library(dplyr) 
+  library(ComplexHeatmap) 
+  library(stageR)         # stage-wise multiple testing correction
+  library(ggplotify)
+  library(ggplot2)
+  library(ggvenn)         # Venn diagrams
+  library(cowplot)        # multi-panel figure assembly
+  library(magick)
+})
+# set working directory and load helper functions
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+```
+
+# Full dataset
+
+## Get the dataset
+
+We load the dataset as a [SummarizedExperiment](https://bioconductor.org/packages/3.23/bioc/vignettes/SummarizedExperiment/inst/doc/SummarizedExperiment.html) object:
+
+```{r}
+se <- readRDS("./datasets/whole_vHC_dataset.rds")
+```
+
+In this dataset, we have 122 ventral hippocampus samples from female and male mice (`Sex`: Female/Male) subjected to either forced swim stress or control conditions (`Condition`: Stress/Ctrl). This dataset combines multiple independent experiments from @floriou-servou_2018, @vonziegler_2022, and @privitera_2024:
+
+```{r}
+summary(as.data.frame(colData(se)[,c("Experiment", "Condition", "Sex")]))
+```
+
+## Split females and males, and conduct differential analysis separately
+
+Perform differential expression analysis (DEA) independently in each sex, then compare the resulting DEG lists.
+
+```{r}
+# For Males
+se_M <- se[,se$Sex == "Male"]
+
+# create an edgeR object, storing count data and associated sample information
+dge_M <- DGEList(counts = assay(se_M, "counts"))
+
+ # calculate TMM normalization factors to correct for differences in library composition between samples
+dge_M <- calcNormFactors(dge_M) 
+
+# design matrix describing the comparison of interest. 
+# Here we test the effect of Stress vs. Ctrl
+mm <- model.matrix(~Condition, data = as.data.frame(colData(se_M)))
+
+# remove genes with low expression (low-count genes provide little statistical power, lead to unreliable dispersion estimates, and inflate false discovery rates)
+keep <- filterByExpr(dge_M, mm, min.count = 10)
+dge_M <- dge_M[keep,] # subset the lowly expressed genes out of se 
+se_M <- se_M[rownames(dge_M), ]
+dge_M <- estimateDisp(dge_M, mm) # estimate dispersion
+
+# # Optional: Visual exploration of data using MDS plot:
+# mds <- plotMDS(dge_M, plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_M)), x=mds$x, y=mds$y)
+# ggplot(mds, aes(x,y,colour=Condition)) + geom_point()
+# ggplot(mds, aes(x,y,colour=Experiment)) + geom_point()
+
+# For females: similar process as above
+se_F <- se[,se$Sex == "Female"]
+dge_F <- DGEList(counts = assay(se_F, "counts"))
+dge_F <- calcNormFactors(dge_F)
+mm <- model.matrix(~Condition, data = as.data.frame(colData(se_F)))
+keep <- filterByExpr(dge_F, mm, min.count = 10)
+dge_F <- dge_F[keep,]
+se_F <- se_F[rownames(dge_F), ]
+dge_F <- estimateDisp(dge_F, mm) 
+
+# # Optional: Visual exploration of data using MDS plot:
+# mds <- plotMDS(dge_F, plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_F)), x=mds$x, y=mds$y)
+# ggplot(mds, aes(x,y,colour=Condition)) + geom_point() 
+# ggplot(mds, aes(x,y,colour=Experiment)) + geom_point()
+```
+
+Surrogate variable analysis to identify hidden sources of unwanted variation 
+(see [@leek_2007; @leek_2012])
+
+```{r}
+set.seed(1)
+# as a rule of thumb, we run sva using both estimators of the number of SVs, and
+# take the smallest of the two
+# se_M <- SEtools::svacor(se_M, ~0 + Condition, numSVmethod="leek", method = "vst")
+# se_M <- SEtools::svacor(se_M, ~0 + Condition, numSVmethod="be", method = "vst")
+# 
+# se_F <- SEtools::svacor(se_F, ~0 + Condition, numSVmethod="leek", method = "vst")
+# se_F <- SEtools::svacor(se_F, ~0 + Condition, numSVmethod="be", method = "vst")
+
+# Use the suggested number of SVs for each subsets
+
+se_M <- SEtools::svacor(se_M, ~ 0 + Condition, n.sv = 6, method = "vst")
+# pp <- plotMDS(assay(se_M, "corrected"), plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_M)), x=pp$x, y=pp$y)
+# ggplot(mds, aes(x,y,shape=Sex,colour=Condition)) + geom_point()
+# ggplot(mds, aes(x,y,colour=Experiment)) + geom_point()
+
+se_F <- SEtools::svacor(se_F, ~ 0 + Condition, n.sv = 2, method = "vst")
+# pp <- plotMDS(assay(se_F, "corrected"), plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_F)), x=pp$x, y=pp$y)
+# ggplot(mds, aes(x,y,shape=Sex,colour=Condition)) + geom_point()
+# ggplot(mds, aes(x,y,colour=Experiment)) + geom_point()
+```
+
+Perform DEA in each subset independently
+
+```{r}
+# For males
+# Compute log2FC changes relative to Ctrls. This assay will later be used for visualization
+se_M <- log2FC(se_M, "corrected", controls=grep("Ctrl", se_M$Condition))
+
+# Incorporate Condition and surrogate variables (SVs) into the design matrix
+formula <- paste(grep("^SV[0-9]", colnames(colData(se_M)), value = TRUE), collapse = "+")
+formula <- as.formula(paste0("~", formula, "+Condition"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_M)))
+dge_M <- calcNormFactors(DGEList(assay(se_M)))  # calculate TMM normalization factor
+dge_M <- estimateDisp(dge_M, mm)  # estimate dispersion
+
+# Fit quasi-likelihood negative-binomial models
+fit_M <- glmQLFit(dge_M, mm, prior.count = 0.5)
+
+Results_stress_M <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit_M, "ConditionStress"),Inf))) 
+# Results_stress_M selects "ConditionStress"
+# Answering the question: is there any Stress effect in males
+
+
+# For females: similar approach
+se_F <- log2FC(se_F, "corrected", controls=grep("Ctrl", se_F$Condition))
+formula <- paste(grep("^SV[0-9]", colnames(colData(se_F)), value = TRUE), collapse = "+")
+formula <- as.formula(paste0("~", formula, "+Condition"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_F)))
+dge_F <- calcNormFactors(DGEList(assay(se_F)))
+dge_F <- estimateDisp(dge_F, mm)
+fit_F <- glmQLFit(dge_F, mm, prior.count=0.5)
+
+Results_stress_F <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit_F, "ConditionStress"),Inf))) 
+# Results_stress_F selects "ConditionStress"
+# Answering the question: is there any Stress effect in females
+```
+
+Above you can see, we need to change the reference sex to get the results. It's complex and not elegant. In the reference anlaysis, we will introduce the contrast-based method, which allows us to write all the contrasts in one matrix and run the fitting only once.
+
+Now let's compare the DEG lists from two independent analysis 
+
+```{r}
+# Significant stress DEGs
+M_signif <- clean_name(rownames(Results_stress_M[Results_stress_M$FDR < 0.05,]))
+F_signif <- clean_name(rownames(Results_stress_F[Results_stress_F$FDR < 0.05,]))
+
+# Find gene unique to M and F
+unique_to_M <- setdiff(M_signif, F_signif)  # genes significant only in males. Often interpreted as "male-specific"
+unique_to_F <- setdiff(F_signif, M_signif)  # genes significant only in females. Often interpreted as "female-specific"
+both_signif <- intersect(M_signif, F_signif) # genes significant in both sexes
+
+# Prepare for visualization
+genes_list <- list("Significant\nin males" = unique_to_M,
+                    "Significant\nin females" = unique_to_F,
+                    "Significant\nin both" = both_signif)
+genes_df <- data.frame(
+  belongTo = rep(names(genes_list), lengths(genes_list)),
+  row.names = unlist(genes_list)
+)
+rownames(se_M) <- clean_name(rownames(se_M))
+rownames(se_F) <- clean_name(rownames(se_F))
+se_M_F <- SEtools::mergeSEs(list(se_M, se_F), do.scale = F, keepRowData = F)
+metadata(se_M_F)$hmcols <- c("darkblue", "white", "darkred")
+DEGs <- intersect(union(F_signif, M_signif), rownames(se_M_F))
+# Annotate DEGs
+rowData(se_M_F)$belongTo <- factor(genes_df$belongTo[match(rownames(se_M_F), rownames(genes_df))], levels = c("Significant\nin both", "Significant\nin females", "Significant\nin males"))
+# change female to first sex (for the figure)
+se_M_F <- se_M_F[, order(se_M_F$Condition, se_M_F$Sex == "Male")]
+```
+
+## Visualization
+
+### Fig 1B
+
+```{r}
+fig1b <- ggvenn(list("Significant\nin females" = F_signif, "Significant\nin males" = M_signif), 
+              fill_color  = c("Significant\nin females" = "#40B0A6", "Significant\nin males" = "#E1BE61"), 
+              auto_scale = T, 
+              set_name_size = 0, set_name_color = "white") +
+         annotate("text", x = -1.3, y = 0.85, label = "Significant\nin females", size = 3.5) +
+         annotate("text", x = 1.45, y = 0.85, label = "Significant\nin males", size = 3.5) + 
+         coord_fixed(clip = "off") 
+fig1b
+```
+
+### Fig 1D
+
+```{r, fig.height=7}
+fig1d <- sechm(
+    se = se_M_F, 
+    features = DEGs, 
+    assayName = "scaledLFC", 
+    gaps_at = c("Condition"), 
+    gaps_row = "belongTo", 
+    top_annotation = c("Condition", "Sex"),
+    anno_labels = c("Condition", "Sex"), 
+    anno_label_gp = c(size = 10, col = "white"),
+    bottom_annotation = c("Experiment"),
+    column_title = NULL,
+    cluster_rows = TRUE, 
+    cluster_row_slices = FALSE,
+    show_row_dend = FALSE,
+    annorow_title_side = NULL,
+    use_raster = TRUE
+    )
+fig1d
+```
+
+# Reduced dataset
+
+In the second section, we repeat the same analysis process using a smaller subset of data. It contrains balanced number of female and males samples. Only one experiment is included.
+
+## Get the dataset
+
+```{r}
+se <- readRDS("./datasets/small_vHC.rds")
+```
+
+## Split females and males, and conduct differential analysis separately
+
+```{r}
+# FOR MALES
+se_M <- se[,se$Sex == "Male"]
+dge_M <- DGEList(counts = assay(se_M, "counts"))
+dge_M <- calcNormFactors(dge_M)
+mm <- model.matrix(~Condition, data = as.data.frame(colData(se_M)))
+keep <- filterByExpr(dge_M, mm, min.count = 10)
+dge_M <- dge_M[keep,] # subset the lowly expressed genes out of se 
+se_M <- se_M[rownames(dge_M), ]
+dge_M <- estimateDisp(dge_M, mm) #estimate dispersion
+
+# # Visual exploration of data:
+# mds <- plotMDS(dge_M, plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_M)), x=mds$x, y=mds$y)
+# ggplot(mds, aes(x,y,colour=Condition)) + geom_point()
+
+# FOR FEMALES
+se_F <- se[,se$Sex == "Female"]
+dge_F <- DGEList(counts = assay(se_F, "counts"))
+dge_F <- calcNormFactors(dge_F)
+mm <- model.matrix(~Condition, data = as.data.frame(colData(se_F)))
+keep <- filterByExpr(dge_F, mm, min.count = 10)
+dge_F <- dge_F[keep,]
+# subset the lowly expressed genes out of se 
+se_F <- se_F[rownames(dge_F), ]
+dge_F <- estimateDisp(dge_F, mm) #estimate dispersion
+
+# #Visual exploration of data:
+# mds <- plotMDS(dge_F, plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_F)), x=mds$x, y=mds$y)
+# ggplot(mds, aes(x,y,colour=Condition)) + geom_point() 
+```
+
+Surrogate variable analysis to identify hidden sources of unwanted variation
+
+```{r}
+set.seed(3)
+
+se_M <- SEtools::svacor(se_M, ~0 + Condition, numSVmethod="leek", method = "vst")
+se_M <- SEtools::svacor(se_M, ~0 + Condition, numSVmethod="be", method = "vst")
+
+se_F <- SEtools::svacor(se_F, ~0 + Condition, numSVmethod="leek", method = "vst")
+se_F <- SEtools::svacor(se_F, ~0 + Condition, numSVmethod="be", method = "vst")
+
+# Use the suggested number of SVs for each subsets
+
+se_M <- SEtools::svacor(se_M, ~0 + Condition, n.sv = 1, method = "vst")
+# pp <- plotMDS(assay(se_M,"corrected"), plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_M)), x=pp$x, y=pp$y)
+# ggplot(mds, aes(x,y,shape=Sex,colour=Condition)) + geom_point()
+
+se_F <- SEtools::svacor(se_F, ~0 + Condition, n.sv = 1, method = "vst")
+# pp <- plotMDS(assay(se_F,"corrected"), plot=FALSE)
+# mds <- cbind(as.data.frame(colData(se_F)), x=pp$x, y=pp$y)
+# ggplot(mds, aes(x,y,shape=Sex,colour=Condition)) + geom_point()
+```
+
+Perform DEA in both subset independently
+
+```{r}
+# For males
+se_M <- log2FC(se_M, "corrected", controls=grep("Ctrl", se_M$Condition))
+formula <- paste(grep("^SV[0-9]", colnames(colData(se_M)), value = TRUE), collapse = "+")
+formula <- as.formula(paste0("~", formula, "+Condition"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_M)))
+dge_M <- calcNormFactors(DGEList(assay(se_M)))
+dge_M <- estimateDisp(dge_M, mm)
+fit_M <- glmQLFit(dge_M, mm, prior.count=0.5)
+
+Results_stress_M <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit_M, "ConditionStress"),Inf))) 
+# Results_stress_M selects "ConditionStress"
+# Answering the question: is there any Stress effect in males (becase male is the reference sex)
+
+
+# For females
+se_F <- log2FC(se_F, "corrected", controls=grep("Ctrl", se_F$Condition))
+formula <- paste(grep("^SV[0-9]", colnames(colData(se_F)), value = TRUE), collapse = "+")
+formula <- as.formula(paste0("~", formula, "+Condition"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_F)))
+dge_F <- calcNormFactors(DGEList(assay(se_F)))
+dge_F <- estimateDisp(dge_F, mm)
+fit_F <- glmQLFit(dge_F, mm, prior.count=0.5)
+
+Results_stress_F <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit_F, "ConditionStress"),Inf))) 
+# Results_stress_F selects "ConditionStress"
+# Answering the question: is there any Stress effect in females (becase female is the reference sex)
+```
+
+Compare the DEG lists from two independent analysis 
+
+```{r}
+# Significant stress DEGs
+M_signif <- clean_name(rownames(Results_stress_M[Results_stress_M$FDR < 0.05,]))
+F_signif <- clean_name(rownames(Results_stress_F[Results_stress_F$FDR < 0.05,]))
+
+# Find gene unique to M and F
+unique_to_M <- setdiff(M_signif, F_signif)
+unique_to_F <- setdiff(F_signif, M_signif)
+both_signif = intersect(M_signif, F_signif)
+
+# Prepare for visualization
+genes_list <- list("Significant\nin males" = unique_to_M,
+                     "Significant\nin females" = unique_to_F,
+                     "Significant\nin both" = both_signif)
+
+genes_df <- data.frame(
+  belongTo = rep(names(genes_list), lengths(genes_list)),
+  row.names = unlist(genes_list)
+)
+rownames(se_M) <- clean_name(rownames(se_M))
+rownames(se_F) <- clean_name(rownames(se_F))
+se_M_F = SEtools::mergeSEs(list(se_M, se_F), do.scale = F, keepRowData = F)
+metadata(se_M_F)$hmcols <- c("darkblue", "white", "darkred")
+DEGs <- intersect(union(F_signif, M_signif), rownames(se_M_F))
+# Annotate DEGs
+rowData(se_M_F)$belongTo <- factor(genes_df$belongTo[match(rownames(se_M_F), rownames(genes_df))], levels = c("Significant\nin both", "Significant\nin females", "Significant\nin males"))
+# change female to first sex (for the figure)
+se_M_F <- se_M_F[, order(se_M_F$Condition, se_M_F$Sex == "Male")]
+```
+
+## Visualization
+
+### Fig 1C
+
+```{r}
+fig1c <- ggvenn(list("Significant\nin females" = F_signif, "Significant\nin males" = M_signif), 
+              fill_color  = c("Significant\nin females" = "#40B0A6", "Significant\nin males" = "#E1BE61"), 
+              auto_scale = T, 
+              set_name_size = 0, set_name_color = "white") +
+         annotate("text", x = -1.6, y = 0.85, label = "Significant\nin females", size = 3.5) +
+         annotate("text", x = 1.6, y = 0.85, label = "Significant\nin males", size = 3.5) + 
+         coord_fixed(clip = "off")
+fig1c
+```
+
+### Fig 1E
+
+```{r}
+fig1e <- sechm(
+    se = se_M_F, 
+    features = DEGs, 
+    assayName = "scaledLFC", 
+    gaps_at = c("Condition"), 
+    gaps_row = "belongTo", 
+    top_annotation = c("Condition", "Sex"),
+    anno_labels = c("Condition", "Sex"), 
+    anno_label_gp = c(size = 10, col = "white"),
+    column_title = NULL,
+    use_raster = TRUE,
+    cluster_rows = TRUE,
+    cluster_row_slices = FALSE,  
+    show_row_dend = FALSE,
+    annorow_title_side = NULL)
+fig1e
+```
+
+# Fig 1 summary
+
+```{r, fig.height=12, fig.width=13, out.width = "100%", warning=FALSE, message=FALSE}
+# 0. Import experimental design illustration
+fig1a <- ggdraw() + draw_image(
+  image_trim(image_read_svg("./figures/experimental_design.svg"))
+)
+# 1. Define a spacer for padding
+title_col1 <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Stress DEGs (n=94M, n=28F)", size = 4, fontface = "bold") + theme_void()
+title_col2 <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Stress DEGs (n=8F, n=8M)", size = 4, fontface = "bold") + theme_void()
+
+# 2. Build Column 1
+col1_plots <- plot_grid(
+  title_col1, 
+  fig1b, 
+  as.ggplot(function() draw(fig1d, merge_legends = TRUE)),
+  ncol = 1, 
+  labels = c("B", "", "D"),
+  rel_heights = c(0.1, 1.4, 2.5) 
+)
+
+# 3. Build Column 2
+col2_plots <- plot_grid(
+  title_col2, 
+  fig1c,
+  as.ggplot(function() draw(fig1e, merge_legends = TRUE)),
+  ncol = 1, 
+  labels = c("C", "", "E"),
+  rel_heights = c(0.1, 1.4, 2.5)
+)
+
+# 4. Final Assembly
+fig1 <- plot_grid(fig1a, plot_grid(col1_plots, col2_plots, ncol = 2, scale = 0.95, align = "v", rel_widths = c(1.3, 1)),
+                          nrow = 2,
+                          labels = c("A", ""),
+                          rel_heights = c(1.1, 2))
+fig1
+
+# save fig1 pdf
+pdf("./figures/fig1_DEGs_overlaps.pdf", width = 12, height = 13)
+fig1
+dev.off()
+```
+
+# Sessoin Info
+
+```{r}
+sessionInfo()
+```
+
+# Reference

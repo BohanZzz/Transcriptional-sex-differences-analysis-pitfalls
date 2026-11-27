@@ -1,0 +1,431 @@
+---
+title: "Supplementary Reference Analysis - Coefficient Approach"
+author: "Bohan Zhang"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+```{css, echo = FALSE}
+p, dl, ol, ul, pre, img, table, h1, h2, h3, h4, h5, h6 {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  text-indent: 0 !important;
+}
+pre code { padding-left: 10px !important; }      /* keep a little space inside the grey box */
+pre.msg  { background-color: #ffffff; color: #cce0f3; } /* set up the color for message output */
+ol, ul { padding-left: 2em !important; }          /* keep bullets visible */
+.main-container { max-width: 1200px !important; } /* optional: use more page width */
+```
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(sechm)
+  library(edgeR)
+  library(dplyr)
+  library(stageR)
+  library(ggplot2)
+  library(patchwork)
+  library(cowplot)
+  library(ggrepel)
+  library(ggplotify)
+})
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+```
+
+# Differential analysis using Coefficient-based approach
+
+In the reference analysis, we introduced contrast-based approach. In this supplementary section, we introduce how to use coefficient-based model.
+
+## Load data
+
+We use the full dataset for this analysis. Same process here as in the reference analysis
+
+```{r}
+se <- readRDS("./datasets/whole_vHC_dataset.rds")
+dge <- DGEList(assay(se, "counts"))
+mm <- model.matrix(~ 0 + group, data=as.data.frame(colData(se)))
+dge <- calcNormFactors(dge)
+# Filter lowly expressed genes
+keep <- filterByExpr(dge, mm, min.count = 10)
+se <- se[keep, ]
+
+# First we use SVA correction to capture latent technical variation
+# There are two embedded methods to estimate the number of SVs: BE and LEEK
+# We take a look at both of their estimation
+set.seed(1)
+tmp <- SEtools::svacor(se, ~ 0 + group, numSVmethod = "be", method = "vst")
+tmp <- SEtools::svacor(se, ~ 0 + group, numSVmethod = "leek", method = "vst")
+# we use 6 SVs as "BE" suggested
+se <- SEtools::svacor(se, ~ 0 + group, n.sv = 6, method = "vst")
+se <- log2FC(se, "corrected", controls = grep("Ctrl", se$group))  # calculate logFC relative to the mean of control samples
+```
+
+## DEA
+
+```{r}
+levels(se$Sex)
+```
+
+In this case, we use Male as reference level.
+
+```{r}
+formula <- paste(grep("^SV[0-9]", colnames(colData(se)), value = TRUE), collapse = "+")
+formula <- as.formula(paste0("~", formula, "+Sex*Condition"))
+
+mm <- model.matrix(formula, data = as.data.frame(colData(se)))
+dge <- calcNormFactors(DGEList(assay(se)))
+dge <- estimateDisp(dge, mm)
+fit <- glmQLFit(dge, mm, prior.count=0.5)
+
+Results_stress <- as.data.frame(topTags(glmQLFTest(fit, grep("Condition", colnames(mm), value=TRUE)), Inf)) 
+# Results_stress selects both ConditionStress and SexFemale:ConditionStress
+# Answering the question: does Stress matter at all, either as a "main" effect or through its interaction with Sex
+
+Results <- as.data.frame(topTags(glmQLFTest(fit, grep("Condition|Sex", colnames(mm), value=TRUE)), Inf))
+# Answering the question: does anything related to Condition or Sex matter
+
+Results_sex <- as.data.frame(topTags(glmQLFTest(fit, "SexFemale"), Inf))
+# Results_sex only selects SexFemale
+# Answering the question: is there any Sex difference specifically at the Condition reference level (Ctrl)
+
+Results_interaction <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit, "SexFemale:ConditionStress"), Inf)))
+# Results_interaction only tests the interaction of Sex and Condition
+# Answering the question: does the Stress effect differs between sexes
+
+Results_M <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit, "ConditionStress"),Inf))) 
+# Results_M selects "ConditionStress"
+# Answering the question: is there any Stress effect in males (because male is the reference sex)
+
+M_signif <- rownames(Results_M[Results_M$FDR < 0.05, ])
+
+# stageR
+# Here we first try to use the pvalue from All Results as the input of screening
+pScreen <- Results$PValue
+names(pScreen) <- rownames(Results)
+pConfirmation <- cbind(Interaction = Results_interaction[row.names(Results),"PValue"])
+stageRObj <- stageR(pScreen = pScreen, pConfirmation = pConfirmation, pScreenAdjusted = FALSE)
+stageRObj <- stageWiseAdjustment(object = stageRObj, method = "none", alpha = 0.05)
+adj_PVals <- getAdjustedPValues(stageRObj, onlySignificantGenes = FALSE, order = FALSE) #returns NA for non-significant gene in pScreen
+adj_PVals <- as.data.frame(adj_PVals)
+Results_interaction$staged.FDR <- adj_PVals[rownames(Results_interaction),]$"Interaction"
+
+intDEGs <- rownames(na.omit(Results_interaction[Results_interaction$staged.FDR < 0.05, ]))
+intDEGs
+```
+
+```{r}
+# To get the Stress effect in Females, the easiest way is to change the reference sex to Male from the very beginning, and run the test again
+# We do this now for later use
+se_femaleRef <- se
+se_femaleRef$Sex <- relevel(se_femaleRef$Sex, ref = "Female")
+mm_femaleRef <- model.matrix(formula, data = as.data.frame(colData(se_femaleRef)))
+dge_femaleRef <- calcNormFactors(DGEList(assay(se_femaleRef)))
+dge_femaleRef <- estimateDisp(dge_femaleRef, mm_femaleRef)
+fit_femaleRef <- glmQLFit(dge_femaleRef, mm_femaleRef, prior.count = 0.5)
+Results_F <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit_femaleRef, "ConditionStress"),Inf))) 
+# Answering the question: is there any Stress effect in females (becase now female is the reference sex)
+F_signif <- rownames(Results_F[Results_F$FDR < 0.05, ])
+```
+
+## A. Volcano plot of interaction genes
+
+Use volcano plot to show the interaction results.
+
+```{r}
+show <- row.names(Results_interaction)[which(Results_interaction$staged.FDR < 0.015 & abs(Results_interaction$logFC) > 0.25)]      
+sup_fig_coef_a <- volcano(Results_interaction, logFC = logFC, signif = staged.FDR, labels = show) + 
+  coord_cartesian(xlim = c(-2.1,4.09)) + labs(x = "Sex:Stress Interaction logFC")
+sup_fig_coef_a
+```
+
+## B. Heatmap of interaction genes
+
+Use heatmap to show the interaction results.
+
+```{r}
+sup_fig_coef_b <- sechm(
+  se = se, 
+  feature = intDEGs,
+  gaps_at = "Condition", 
+  assayName = "corrected", 
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE, 
+  anno_label_gp = list(size = 8, col = "white"),
+  do.scale = TRUE, 
+  name = "z-score", 
+  show_rownames = FALSE,
+  cluster_rows = TRUE, 
+  show_row_dend = FALSE,
+  breaks = 0.98,
+  column_title = NULL,
+  use_raster = TRUE  
+)
+sup_fig_coef_b
+```
+
+## C. The correlation of interaction logFC and baseline logFC between sexes
+
+```{r}
+Results_interaction$logFC.Sex <- Results_sex[row.names(Results_interaction), "logFC"]
+Results_interaction$logFC.stressMales <- Results_M[row.names(Results_interaction), "logFC"] 
+
+Results_interaction2 <- Results_interaction[which(Results_interaction$staged.FDR < 0.15 & abs(Results_interaction$logFC) > 0.1),]
+ct <- cor.test(Results_interaction2$logFC, Results_interaction2$logFC.Sex)
+sup_fig_coef_c <- ggplot(Results_interaction2, aes(logFC.Sex, logFC)) + 
+  geom_vline(xintercept = 0, colour = "darkgray") +
+  geom_hline(yintercept = 0, colour = "darkgray") + 
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x, method = "lm") + 
+  theme_bw() +
+  labs(x = "Baseline logFC between sexes", y = "Sex:Stress interaction logFC") +
+  annotate("text", x = -Inf, y = -Inf, label = paste0(" R=", round(ct$estimate,2)," ***\n"), hjust = 0, vjust = 0)
+sup_fig_coef_c
+```
+
+## Improved stageR Strategy
+
+When we use the All Results to do FDR correction, there are a lot of genes that are driven by baseline sex difference but the stress effect of them are not obvious. So in the next chunk, we only use stress-relevan contrasts in screening, so that the screening is more targeted increases power
+
+```{r}
+# use stagedFDR to boost power for Sex*Stress (interaction term)
+# Here we use everything except for Male.vs.Female as the screening model
+Results_Screen2 <- as.data.frame(topTags(glmQLFTest(fit, grep("Condition", colnames(mm), value=TRUE)), Inf))
+pScreen2 <- Results_Screen2$PValue
+names(pScreen2) <- rownames(Results_Screen2)
+pConfirmation2 <- cbind(Interaction = Results_interaction[row.names(Results_Screen2),"PValue"])
+stageRObj2 <- stageR(pScreen = pScreen2, pConfirmation = pConfirmation2, pScreenAdjusted = FALSE)
+stageRObj2 <- stageWiseAdjustment(object = stageRObj2, method = "none", alpha = 0.05)
+
+adj_PVals2 <- getAdjustedPValues(stageRObj2, onlySignificantGenes = FALSE, order = FALSE) #returns NA for non-significant gene in pScreen
+adj_PVals2 <- as.data.frame(adj_PVals2)
+
+Results_interaction$staged.FDR <- adj_PVals2[rownames(Results_interaction),]$"Interaction"
+intDEGs2 <- rownames(na.omit(Results_interaction[Results_interaction$staged.FDR < 0.05, ]))
+intDEGs2
+
+```
+
+## D. Comparison of logFCs upon Stress in males and females 
+
+```{r}
+merge_M_F <- merge(Results_M, Results_F, by = "row.names", suffix = c(".males", ".females"))
+
+merge_M_F$proteinCoding <- rowData(se)[merge_M_F$Row.names, "proteinCoding"]  
+
+merge_M_F <- merge_M_F[which(merge_M_F$Row.names %in% intDEGs2 & merge_M_F$proteinCoding),] # select protein-coding genes with significant Sex*Stress interaction
+
+sup_fig_coef_d <- ggplot(merge_M_F, aes(logFC.males, logFC.females)) + 
+  geom_vline(xintercept = 0, colour = "darkgray") +
+  geom_hline(yintercept = 0, colour = "darkgray") + 
+  geom_abline(slope=1) +
+  geom_segment(aes(y=low.females, yend=high.females), color="grey") + 
+  geom_segment(aes(x=low.males, xend=high.males), color="grey") + 
+  theme_bw() + 
+  geom_point() + 
+  ggrepel::geom_text_repel(data=merge_M_F[which(abs(merge_M_F$logFC.males)>0.1 | abs(merge_M_F$logFC.females)>0.1),],
+    aes(label=gsub(".+\\.","",Row.names)), max.overlaps = 30, min.segment.length = 0, size=3) +
+  labs(x="logFC upon Stress in males", y="logFC upon Stress in females")
+sup_fig_coef_d
+```
+
+## E. Heatmap of protein-coding genes with significant Sex*Stress interaction
+
+```{r}
+cands2 <- intersect(intDEGs2, row.names(se)[which(rowData(se)$proteinCoding)])
+
+sup_fig_coef_e <- sechm(
+  se = se, 
+  feature = cands2, 
+  gaps_at = "Condition", 
+  assayName = "corrected", 
+  do.scale = TRUE, 
+  row_names_gp = gpar(fontsize=7),
+  name = "z-score", 
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE, 
+  anno_label_gp = list(size = 8, col = "white"),  breaks = 0.99, 
+  row_labels = gsub(".+\\.","",cands2),
+  use_raster = TRUE,
+  column_title = NULL
+)
+sup_fig_coef_e
+```
+
+## Top ten genes with a significant interaction and the largest interaction logFC
+
+```{r}
+intDF <- Results_interaction[order(abs(Results_interaction$logFC), decreasing = TRUE), ]
+top10cand <- head(intDF[which(intDF$staged.FDR < 0.05 & abs(intDF$logFC) > 0.1 & rownames(intDF) %in% cands2),], 10)   # top10 candidates (protein-coding)
+gsub(".+\\.","", rownames(top10cand))
+```
+
+They are the same genes from the top10 candidates from the reference analysis.
+
+## F. Compare with Brivio geneset
+
+```{r}
+brivioGenes <- tools::toTitleCase(tolower(readLines("./datasets/BrivioSexStressGenes2.txt")))
+brivioGenes <- getrn(se, brivioGenes)
+# check if they overlap with intDEGs:
+overlap_gene <- intersect(brivioGenes, intDEGs)
+# only Mthfr overlaps
+
+merge_M_F <- merge(Results_M, Results_F, by="row.names", suffix=c(".males",".females"))
+merge_M_F_brivio <- merge_M_F[which(merge_M_F$Row.names %in% brivioGenes),]
+ct <- cor.test(merge_M_F_brivio$logFC.males, merge_M_F_brivio$logFC.females)
+sup_fig_coef_f <- ggplot(merge_M_F_brivio, aes(logFC.males, logFC.females)) + 
+  geom_vline(xintercept = 0, colour = "darkgray") +
+  geom_hline(yintercept = 0, colour = "darkgray") + 
+  geom_abline(slope = 1) +
+  geom_segment(aes(y = low.females, yend = high.females), color = "grey") + 
+  geom_segment(aes(x = low.males, xend = high.males), color = "grey") + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 10)) + 
+  geom_point() + 
+  geom_smooth(formula = y ~ 0 + x, method = "lm") + 
+  ggrepel::geom_text_repel(data = merge_M_F_brivio[which(abs(merge_M_F_brivio$logFC.males) > 0.25 | abs(merge_M_F_brivio$logFC.females) > 0.25), ],
+    aes(label = gsub(".+\\.","",Row.names)), max.overlaps = 30, min.segment.length = 0, size = 3) +
+  ggrepel::geom_text_repel(data = merge_M_F_brivio[which(merge_M_F_brivio$Row.names %in% overlap_gene), ],
+    aes(label = gsub(".+\\.","",Row.names)), nudge_x = 0.1, nudge_y = -0.05, max.overlaps = 30, min.segment.length = 0, size = 3) +    
+  labs(x = "logFC upon Stress in males", y = "logFC upon Stress in females") +
+  annotate("text", x = Inf, y = -Inf, label = paste0(" R=", round(ct$estimate, 2), " ***\n"), hjust = 1, vjust = 0)
+sup_fig_coef_f
+```
+
+## G. Slope regression
+
+In next chunk we ask: does female stress response differ systematically from male response? To answer this, we fit a regression of (female logFC - male logFC) ~ male logFC. We did this in three different gene sets: DEGs from full dataset; balanced DEGs; DEGs from balanced data.
+
+```{r}
+# Gene set 1. DEGs from differential analysis of the full dataset, both sexes pooled
+merge_M_F <- merge(Results_M, Results_F, by = "row.names", suffix = c(".males",".females"))
+m1 <- merge_M_F[which(merge_M_F$Row.names %in% row.names(Results_stress)[which(Results_stress$FDR < 0.05)]),]
+# Here this gene set is selected form the analysis which is dominated by males (more samples in the data). 
+# So we might have detected more DEGs in males (since we have more power there), which could have led to a bias towards males
+# # Thus we also use two other different gene sets.
+
+# Gene set 2. balanced DEGs. 
+# Take the same number of top male DEGs as female DEGs, to avoid male-dominated gene selection
+balanced_degs <- union(head(row.names(Results_M), sum(Results_F$FDR < 0.05)), row.names(Results_F)[which(Results_F$FDR < 0.05)])  # Since female has less significant genes than male, we extract the number of female DEGs
+m2 <- merge_M_F[which(merge_M_F$Row.names %in% balanced_degs),]
+
+# Gene set 3. DEGs from a sex-balanced dataset
+# Here we select equal number of males and females, then re-run the differential analysis
+# This also removes the power imbalance between sexes
+# In this supplement, we only do subsampling once. (See reference analysis for the permutation)
+
+set.seed(1234)
+  # In our data, females only exist in two batches: Privitera.E2 and vonZiegler.E3
+  # To balance also between different batches, we select 2 ctrl males and 3 stress males from Privitera.E1 batch (the reason to select from this batch is that in MDS plot, this batch is the closest one from batch vonZiegler.E3)
+batch_with_both_sexes <- colnames(se)[se$Experiment %in% c("vonZiegler.E3", "Privitera.E2")]
+male_ctrl_Privitera.E1 <- sample(colnames(se)[se$Experiment == "Privitera.E1" & se$group == "Male_Ctrl"], 2, replace = FALSE)
+male_stress_Privitera.E1 <- sample(colnames(se)[se$Experiment == "Privitera.E1" & se$group == "Male_Stress"], 3, replace = FALSE)
+se_sub <- se[,c(batch_with_both_sexes, male_ctrl_Privitera.E1, male_stress_Privitera.E1)]
+
+# filter
+dge <- DGEList(assay(se_sub, "counts"))
+mm <- model.matrix(~ 0 + group, data=as.data.frame(colData(se_sub)))
+dge <- calcNormFactors(dge)
+# Filter lowly expressed genes
+keep <- filterByExpr(dge, mm, min.count = 10)
+se_sub <- se_sub[keep, ]
+
+# SVA correction
+suppressMessages(suppressWarnings(invisible(capture.output(
+    se_sub <- SEtools::svacor(se_sub, ~ 0 + group, n.sv = 2, method = "vst")
+  ))))
+
+# DEA
+formula <- paste(grep("^SV[0-9]", colnames(colData(se_sub)), value = TRUE), collapse = "+")
+formula <- as.formula(paste0("~", formula, "+Sex*Condition"))
+mm <- model.matrix(formula, data = as.data.frame(colData(se_sub)))
+dge <- calcNormFactors(DGEList(assay(se_sub)))
+dge <- estimateDisp(dge, mm)
+fit <- glmQLFit(dge, mm, prior.count=0.5)
+
+Results_stress_balanceddata <- as.data.frame(topTags(glmQLFTest(fit, grep("Condition", colnames(mm), value=TRUE)), Inf)) 
+
+m3 <- merge_M_F[merge_M_F$Row.names %in% rownames(Results_stress_balanceddata)[Results_stress_balanceddata$FDR < 0.05], ]
+nrow(m3)
+# the number of DEGs are decent
+
+# Linear regression on three gene sets: do females respond less than males?
+# For each gene set: (femaleLogFC - maleLogFC) ~ maleLogFC
+stats <- as.data.frame(t(sapply(list(full = m1, balancedDEGs = m2, balancedData = m3), \(x){
+  coef(summary(lm(logFC.females - logFC.males ~ 0 + logFC.males, data = x)))[,-3]
+  })))
+stats$lab <- paste0(" ", row.names(stats), ": ", round(stats[,1], 3), "; p=", round(stats[,3], 4))
+
+sup_fig_coef_g <- ggplot(m1, aes(logFC.males, logFC.females)) + 
+  geom_vline(xintercept = 0, colour = "darkgray") +
+  geom_hline(yintercept = 0, colour = "darkgray") + 
+  theme_bw() + 
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-1.5, 2.5)) + 
+  geom_abline(slope = 1) + geom_point(alpha = 0.1, size = 0.3) + 
+  geom_smooth(formula = y ~ 0 + x, method = "lm") +
+  labs(x = "logFC upon Stress in males", y = "logFC upon Stress in females") +
+  theme(axis.title = element_text(size = 10)) + 
+  annotate("text", label = paste0("\n",paste(stats$lab, collapse = "\n")), x = -Inf, y = Inf, hjust = 0, vjust = 1, size = 4)
+sup_fig_coef_g
+```
+
+# Save Objects for later use
+
+```{r}
+# save the result
+stress_degs_MFunion <- union(M_signif, F_signif) 
+stressed_animals <- se[,se$Condition == "Stress"]$SampleName
+mean_log2fc <- rowMeans(assay(se, "log2FC")[stress_degs_MFunion, stressed_animals])
+filtered_stress_degs_MFunion <- mean_log2fc[abs(mean_log2fc) > 0.1]
+
+DEGs <- list(
+  MF_union_stress_degs = stress_degs_MFunion,
+  MF_stress_degs_filtered = filtered_stress_degs_MFunion,
+  Interaction_degs_stageR_by_allResults = intDEGs, 
+  Interaction_degs_stageR_by_subsetResults = intDEGs2)
+
+coef_obj = list(se = se, 
+                   DEGs = DEGs,
+                   edgeR = Results)
+saveRDS(coef_obj, "./objects/coef_obj.rds")
+```
+
+# Figure summary
+
+```{r, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10, out.width = "100%"}
+pdf("./supplements/supp_coefficient_analysis.pdf", width = 10, height = 10)
+supp_coef <- plot_grid(
+              plot_grid(sup_fig_coef_a + theme(legend.position = "none"), 
+                        as.ggplot(function() draw(sup_fig_coef_b, merge_legends = TRUE)) + theme(plot.margin = margin(0, 0, 22, 15)), 
+                        sup_fig_coef_c,
+                        nrow = 1, labels = "AUTO", rel_widths = c(3,4,3)),
+              plot_grid(sup_fig_coef_d, 
+                        as.ggplot(function() draw(sup_fig_coef_e, merge_legends = TRUE)) + theme(plot.margin = margin(0, 0, 22, 15)), 
+                        labels = LETTERS[4:5]),
+              plot_grid(sup_fig_coef_f, 
+                        sup_fig_coef_g, 
+                        scale = 0.98, labels = LETTERS[6:7], nrow = 1, rel_widths = c(3,4)),
+              nrow = 3)
+supp_coef
+
+pdf("./supplements/supp_coefficient_analysis.pdf", width = 10, height = 10)
+supp_coef
+dev.off()
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```

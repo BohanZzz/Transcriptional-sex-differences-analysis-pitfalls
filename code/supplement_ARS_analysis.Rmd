@@ -1,0 +1,361 @@
+---
+title: "ARS analysis"
+author: "Bohan Zhang"
+date: "`r doc_date()`"
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+bibliography: ../inst/REFERENCES.bib
+---
+```{css, echo = FALSE}
+p, dl, ol, ul, pre, img, table, h1, h2, h3, h4, h5, h6 {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  text-indent: 0 !important;
+}
+pre code { padding-left: 10px !important; }      /* keep a little space inside the grey box */
+pre.msg  { background-color: #ffffff; color: #cce0f3; } /* set up the color for message output */
+ol, ul { padding-left: 2em !important; }          /* keep bullets visible */
+.main-container { max-width: 1200px !important; } /* optional: use more page width */
+```
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(sechm)
+  library(edgeR)
+  library(dplyr)
+  library(stageR)
+  library(ggplot2)
+  library(patchwork)
+  library(cowplot)
+  library(ggrepel)
+  library(ggplotify)
+})
+wd <- "/mnt/gapp/work/bohan/transcriptional_sex_difference_analysis_pitfalls/bohan_ver"
+setwd(wd)
+knitr::opts_knit$set(root.dir = wd)
+knitr::opts_chunk$set(warning = FALSE, class.message = "msg")
+source("./code/function.R")
+```
+
+# Load dataset
+
+The meta SE object contains 122 animals from forced swim stress cohort, and 63 animals from acute restraint stress (ARS) cohort from @waag_2025. The aim of this section is to compare the results from these two cohorts.
+
+```{r}
+se <- readRDS(file = "./datasets/meta_se.rds")
+table(se$Stressor, se$Sex)
+
+# First we focus on ARS cohort
+se_ARS <- se[ ,se$Stressor == "ARS"]
+se_ARS$group <- paste0(se_ARS$Sex, "_", se_ARS$Condition)
+se_ARS <- se_ARS[ , order(se_ARS$Condition, se_ARS$Sex == "Male")]
+metadata(se_ARS)$hmcols <- c("darkblue", "white", "darkred")
+metadata(se_ARS)$anno_colors <- List(
+  Sex = c(Male = "#E1BE61", Female = "#40B0A6"),
+  Condition = c("Stress" = "#006CD1", "Ctrl" = "#994F00"))
+
+dge <- DGEList(assay(se_ARS, "counts"))
+mm <- model.matrix(~ 0 + group, data=as.data.frame(colData(se_ARS)))
+dge <- calcNormFactors(dge)
+# Filter lowly expressed genes
+keep <- filterByExpr(dge, mm, min.count = 10)
+# Subset SE to only filtered genes
+se_ARS <- se_ARS[keep, ]
+
+set.seed(1)
+tmp <- SEtools::svacor(se_ARS, ~ 0 + group, numSVmethod = "be", method = "vst")
+tmp <- SEtools::svacor(se_ARS, ~ 0 + group, numSVmethod = "leek", method = "vst")
+# we use 2 SVs as suggested
+se_ARS <- SEtools::svacor(se_ARS, ~ 0 + group, n.sv = 2, method = "vst")
+se_ARS <- log2FC(se_ARS, "corrected", controls = grep("Ctrl", se_ARS$group))
+saveRDS(se_ARS, "./objects/ARS_dataset_with_correction.rds")
+```
+
+# DEA
+
+We use the same pipeline as in `reference_analysis.Rmd` to analyse ARS cohort.
+
+```{r}
+dge <- calcNormFactors(DGEList(assay(se_ARS)))
+formula <- as.formula(paste(c("~ 0 + group", grep("^SV[0-9]+$",colnames(colData(se_ARS)),value=TRUE)), collapse="+"))
+mm <- model.matrix(formula , data = as.data.frame(colData(se_ARS))) 
+dge <- estimateDisp(dge, mm)
+fit <- glmQLFit(dge, mm, pseudocount = 0.5)
+
+#Define the constrasts to test for:
+contrast <- makeContrasts(
+  Stress_vs_CTRL = (groupFemale_Stress + groupMale_Stress) / 2 - (groupFemale_Ctrl + groupMale_Ctrl) / 2,  # Overall stress effect, averaged equally across both sexes
+  F_M_Stress = (groupFemale_Stress - groupFemale_Ctrl) - (groupMale_Stress - groupMale_Ctrl),  # Sex*Stress interaction: does the stress response differ between sexes?
+  F_vs_M_Ctrl = groupFemale_Ctrl - groupMale_Ctrl,  # Baseline sex difference (in Ctrls only) 
+  F_vs_M_Stress = groupFemale_Stress - groupMale_Stress,  # Sex difference in Stress group
+  F_Stress = groupFemale_Stress - groupFemale_Ctrl, # Stress response in females
+  M_Stress = groupMale_Stress - groupMale_Ctrl, # Stress response in males
+  levels = mm)
+
+Results_interaction <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[,"F_M_Stress"]),Inf)))
+# Difference in response to stress between sexes
+Results_stress <- addlogFCSE(as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[,"Stress_vs_CTRL"]),Inf)))
+# Average stress response across sexes
+
+# use stageR to correct the Pvalue for interaction
+Results2 <- as.data.frame(topTags(glmQLFTest(fit, contrast = contrast[, c("F_Stress", "M_Stress", "F_M_Stress", "Stress_vs_CTRL")]),Inf))
+pScreen2 <- Results2$PValue
+names(pScreen2) <- rownames(Results2)
+
+pConfirmation2 <- cbind(Interaction = Results_interaction[row.names(Results2),"PValue"])
+
+stageRObj2 <- stageR(pScreen = pScreen2, pConfirmation = pConfirmation2, pScreenAdjusted = FALSE)
+stageRObj2 <- stageWiseAdjustment(object = stageRObj2, method = "none", alpha = 0.05)
+
+adj_PVals2 <- getAdjustedPValues(stageRObj2, onlySignificantGenes = FALSE, order = FALSE) #returns NA for non-significant gene in pScreen
+adj_PVals2 <- as.data.frame(adj_PVals2)
+
+Results_interaction$staged.FDR <- adj_PVals2[rownames(Results_interaction),]$"Interaction"
+intDEGs <- rownames(na.omit(Results_interaction[Results_interaction$staged.FDR < 0.05, ]))
+intDEGs
+```
+
+# Stress-responsive DEGs
+
+## Heatmaps
+
+We first plot the stress-responsive DEGs for both FSS and ARS dataset, to see how similar they are
+
+```{r, warning}
+FSS_obj <- readRDS("./objects/reference_analysis_obj.rds")
+
+se_FSS <- FSS_obj$se
+
+stress_DEGs_ARS <- rownames(Results_stress[Results_stress$FDR < 0.01, ])
+stress_DEGs_FSS <- rownames(rowData(se_FSS)$DEA.Stress_vs_CTRL[rowData(se_FSS)$DEA.Stress_vs_CTRL$FDR < 0.01, ])
+stress_DEGs_union <- union(stress_DEGs_ARS, stress_DEGs_FSS)
+stress_DEGs_union <- intersect(intersect(stress_DEGs_union, rownames(se_FSS)), rownames(se_ARS)[which(rowData(se_ARS)$proteinCoding)])
+
+# First calculate two simple heatmaps for the input of commonScale (to unify the scales of two heatmaps)
+supp_ARSa_left <- sechm(
+  se = se_FSS,
+  feature = stress_DEGs_union,
+  gaps_at = "Condition",
+  assayName = "corrected",
+  do.scale = TRUE)
+
+supp_ARSa_right <- sechm(
+  se = se_ARS,
+  feature = stress_DEGs_union, 
+  gaps_at = "Condition",
+  assayName = "corrected",
+  do.scale = TRUE)
+
+# rescale to the same scale, and set up the rest of the parameters
+cs <- commonScale(supp_ARSa_left, supp_ARSa_right)
+supp_ARSa_left <- sechm(
+  se = se_FSS,
+  feature = stress_DEGs_union,
+  gaps_at = "Condition",
+  column_gap = unit(2, "mm"),
+  assayName = "corrected",
+  do.scale = TRUE,
+  name = "z-score",
+  # heatmap_legend_param = list(title = "z-score"),
+  use_raster = TRUE,
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE,
+  anno_label_gp = list(size = 8, col = "white"),
+  annocol_title_side = NA,
+  breaks = cs$breaks,
+  hmcols = cs$hmcols,
+  column_title = "FSS",
+  column_title_gp = gpar(fontsize = 10),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 8))
+
+supp_ARSa_right <- sechm(
+  se = se_ARS,
+  feature = stress_DEGs_union, 
+  gaps_at = "Condition",
+  column_gap = unit(2, "mm"),
+  assayName = "corrected",
+  do.scale = TRUE,
+  use_raster = TRUE,
+  name = "z-score_ARS",
+  show_heatmap_legend = FALSE,
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE,
+  anno_label_gp = list(size = 8, col = "white"),
+  breaks = cs$breaks,
+  hmcols = cs$hmcols,
+  column_title = "ARS",
+  column_title_gp = gpar(fontsize = 10),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 8),
+  cluster_rows = FALSE
+)
+
+## combined + labels 
+supp_ARSa <- as.ggplot(function() {draw(supp_ARSa_left + supp_ARSa_right, ht_gap = unit(6, "mm"), merge_legends = TRUE)})
+supp_ARSa
+
+```
+
+## Scatter plot
+
+```{r}
+Results_stress_FSS <- rowData(se_FSS)$DEA.Stress_vs_CTRL
+merge_stress <- merge(Results_stress_FSS, Results_stress, by = "row.names", suffix = c(".FSS", ".ARS"))
+merge_stress$proteinCoding <- rowData(se_ARS)[merge_stress$Row.names, "proteinCoding"]
+merge_stress <- merge_stress[which(merge_stress$Row.names %in% stress_DEGs_union & merge_stress$proteinCoding),]
+
+supp_ARSb <- ggplot(merge_stress, aes(logFC.FSS, logFC.ARS)) + 
+  geom_vline(xintercept = 0, colour = "darkgray") +
+  geom_hline(yintercept = 0, colour = "darkgray") + 
+  geom_abline(slope = 1) +
+  geom_segment(aes(y = low.ARS, yend = high.ARS), color="grey") + 
+  geom_segment(aes(x = low.FSS, xend = high.FSS), color="grey") + 
+  theme_bw() + 
+  theme(
+    axis.title = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 16))+
+  geom_point() + 
+  ggrepel::geom_text_repel(data = merge_stress[which(abs(merge_stress$logFC.FSS) > 1 | abs(merge_stress$logFC.ARS)> 1),],
+    aes(label=gsub(".+\\.","",Row.names)), max.overlaps = 30, min.segment.length = 0, size = 3) +
+  labs(x="Stress logFC in FSS data", y="Stress logFC in ARS data", title = "")
+supp_ARSb
+```
+
+# Plot FSS and ARS interaction DEGs on both datasets
+
+## Heatmaps
+
+```{r, warning = FALSE}
+intDEGs_FSS <- read.table("./objects/interaction_genes_swim_full_dataset.txt")
+intDEGs_FSS <- intDEGs_FSS$x
+
+cands_FSS <- intersect(intDEGs_FSS, rownames(se_ARS)[which(rowData(se_ARS)$proteinCoding)])
+cands_ARS <- intDEGs
+cands <- list(
+  FSS = cands_FSS,
+  ARS = cands_ARS
+)
+names(cands) <- c("FSS\nintDEGs", "ARS\nintDEGs")
+
+supp_ARSc_left <- sechm(
+  se = se_FSS,
+  feature = cands,
+  gaps_at = "Condition",
+  column_gap = unit(2, "mm"),
+  row_gap = unit(2, "mm"),
+  assayName = "corrected",
+  do.scale = TRUE,
+  name = "z-score_FSS",
+  show_heatmap_legend = FALSE,
+  show_annotation_legend = FALSE, 
+  use_raster = TRUE,
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE,
+  anno_label_gp = list(size = 8, col = "white"),
+  annocol_title_side = NA,
+  breaks = cs$breaks, # use the common scales as before
+  hmcols = cs$hmcols,
+  column_title = "FSS",
+  column_title_gp = gpar(fontsize = 10),
+  row_title_gp = gpar(fontsize = 10),
+  row_labels = gsub(".+\\.", "", unlist(cands, use.names = FALSE))
+)
+
+supp_ARSc_right <- sechm(
+  se = se_ARS,
+  feature = cands, 
+  gaps_at = "Condition",
+  column_gap = unit(2, "mm"),
+  row_gap = unit(2, "mm"),
+  assayName = "corrected",
+  do.scale = TRUE,
+  use_raster = TRUE,
+  name = "z-score_ARS",
+  show_heatmap_legend = FALSE,
+  show_annotation_legend = FALSE, 
+  top_annotation = c("Condition", "Sex"),
+  anno_labels = TRUE,
+  anno_label_gp = list(size = 8, col = "white"),  breaks = cs$breaks,
+  hmcols = cs$hmcols,
+  column_title = "ARS",
+  column_title_gp = gpar(fontsize = 10),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 8),
+  row_labels = gsub(".+\\.", "", unlist(cands, use.names = FALSE)),
+  cluster_rows = FALSE
+)
+
+## combined + labels 
+supp_ARSc <- as.ggplot(function() {draw(supp_ARSc_left + supp_ARSc_right, ht_gap = unit(6, "mm"), merge_legends = TRUE)})
+supp_ARSc
+```
+
+## Scatter plot
+
+```{r}
+Results_interaction_FSS <- read.table("./objects/DEA_interaction_result_swim_full_dataset.txt")
+merge_int <- merge(Results_interaction_FSS, Results_interaction, by = "row.names", suffix = c(".FSS", ".ARS"))
+merge_int$proteinCoding <- rowData(se_ARS)[merge_int$Row.names, "proteinCoding"]
+merge_int <- merge_int[which(merge_int$Row.names %in% unlist(cands, use.names = FALSE) & merge_int$proteinCoding),]
+
+supp_ARSd <- ggplot(merge_int, aes(logFC.FSS, logFC.ARS)) + 
+  geom_vline(xintercept = 0, colour = "darkgray") +
+  geom_hline(yintercept = 0, colour = "darkgray") + 
+  geom_abline(slope=1) +
+  geom_segment(aes(y = low.ARS, yend = high.ARS), color="grey") + 
+  geom_segment(aes(x = low.FSS, xend = high.FSS), color="grey") + 
+  theme_bw() + 
+  theme(
+    axis.title = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 16))+
+  geom_point() + 
+  ggrepel::geom_text_repel(data=merge_int[which(abs(merge_int$logFC.FSS)>0.1 | abs(merge_int$logFC.ARS)>0.1),],
+    aes(label=gsub(".+\\.","",Row.names)), max.overlaps = 30, min.segment.length = 0, size=3) +
+  labs(x="Interaction logFC in FSS data", y="Interaction logFC in ARS data", title = "")
+supp_ARSd
+```
+
+# Figure summary
+
+```{r, warning = FALSE, message = FALSE, fig.width = 11, fig.height = 11, out.width = "100%"}
+title1 <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Union of Stress DEGs From Both Dataset", size = 5, fontface = "bold") + theme_void()
+title2 <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Sex:Stress Interaction DEGs from Both Dataset", size = 5, fontface = "bold") + theme_void()
+spacer <- ggplot() + theme_void()
+supp_ARS <- plot_grid(
+              plot_grid(title1, labels = c("A")),
+              plot_grid(
+                supp_ARSa,
+                supp_ARSb,
+                nrow = 1, rel_widths = c(2, 1)
+                ),
+              plot_grid(title2, labels = c("B")),
+              plot_grid(
+                supp_ARSc,
+                supp_ARSd,
+                nrow = 1, rel_widths = c(2, 1)
+                ),
+              spacer,
+              nrow = 5, rel_heights = c(0.05, 1, 0.05, 1, 0.02)
+            )
+supp_ARS
+
+pdf("./supplements/supp_ARS_swim.pdf", width = 11, height = 11)
+supp_ARS
+dev.off()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+# Reference
